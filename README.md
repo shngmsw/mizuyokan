@@ -54,7 +54,7 @@ Jev を使う場合は API キーを登録します（後述）。登録しな�
 | `scripts/install-dev-dll.ps1` | インストール済み azooKey の IME DLL を開発版に差し替える |
 | `scripts/set-jev-key.ps1` | Jev の API キーを DPAPI で暗号化して保存する |
 
-Upstream pin: `65835aa1afd9ae7fafd7c58a86ea017877ebc58f`
+Upstream pin: `65835aa1afd9ae7fafd7c58a86ea017877ebc58f`（ライセンスは上記「ライセンスと配布の形」を参照）
 
 ## 開発
 
@@ -117,6 +117,9 @@ cargo test -p azookey-windows live_ -- --ignored --nocapture   # 起動中の az
 - Jev の応答待ちのぶん、英語部分の表示が 1〜2 文字遅れることがあります。
 - 端末内の英単語リストに無い語は、ローマ字として読めない箇所からの推定に頼ります。区切りを誤ることがあり、Jev を使うほうが安定しやすいです。
 
-## 注意
+## ライセンスと配布の形
 
-azooKey-Windows 向けの非公式な改変です。本家リポジトリへの取り込みは別途の話になります。
+- このリポジトリ（`engine/` とドキュメントなど）は [MIT License](LICENSE) です。
+- `overlay/` は [azooKey-Windows](https://github.com/fkunn1326/azooKey-Windows)（MIT、Copyright (c) 2026 fkunn1326）を改変して当てる差分です。元の著作権表示は [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) にあります。
+- **公式のインストーラやビルド済みバイナリは同梱しません。** 利用時は azooKey-Windows を自分で入れ、必要なら DLL だけ差し替えます（`scripts/install-dev-dll.ps1`）。
+- 本家への取り込みとは無関係の、非公式な改変です。

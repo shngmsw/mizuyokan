@@ -15,7 +15,7 @@ logs
 target/
 engine/Cargo.lock
 
-# Local / agent artifacts
-agent-tools
-/tmp
+# Local azooKey checkout + binaries (never publish these)
 /azookey-windows-mizuyokan
+*.dll
+*.exe
