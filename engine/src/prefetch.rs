@@ -36,9 +36,19 @@ struct State {
 }
 
 impl State {
-    fn store(&mut self, raw: String, judgement: Judgement) {
+    fn finish_in_flight(&mut self, raw: &str) {
+        self.in_flight.remove(raw);
+    }
+
+    /// Remember a successful judgement. Failures are not cached so a later
+    /// keystroke can retry once the API is healthy again.
+    fn store_chosen(&mut self, raw: String, segments: Vec<Segment>) {
         self.in_flight.remove(&raw);
-        if self.done.insert(raw.clone(), judgement).is_none() {
+        if self
+            .done
+            .insert(raw.clone(), Judgement::Chosen(segments))
+            .is_none()
+        {
             self.order.push_back(raw);
         }
         while self.order.len() > MAX_ENTRIES {
@@ -70,15 +80,15 @@ pub fn judge_segments(raw: &str, judge: &Judge) -> Judgement {
 }
 
 pub fn jev_judge(config: JevConfig) -> Arc<Judge> {
-    Arc::new(move |raw: &str, options: &[String]| {
-        let probs = JevClient::new(config.clone())
-            .choose_reading(raw, options)
-            .ok()?;
-        probs
+    Arc::new(move |raw: &str, options: &[String]| match JevClient::new(config.clone())
+        .choose_reading(raw, options)
+    {
+        Ok(probs) => probs
             .iter()
             .enumerate()
             .max_by(|a, b| a.1.total_cmp(b.1))
-            .map(|(i, _)| i)
+            .map(|(i, _)| i),
+        Err(_) => None,
     })
 }
 
@@ -110,14 +120,18 @@ impl Prefetcher {
         std::thread::spawn(move || {
             let judgement = judge_segments(&raw, judge.as_ref());
             if let Ok(mut state) = self.state.lock() {
-                state.store(raw, judgement);
+                match judgement {
+                    Judgement::Chosen(segments) => state.store_chosen(raw, segments),
+                    Judgement::Failed => state.finish_in_flight(&raw),
+                }
             }
             self.ready.notify_all();
         });
     }
 
     /// Result for `raw`, waiting up to `timeout` if a request is in flight.
-    /// Returns `None` when `raw` was never requested.
+    /// `None` = never requested (or a failed attempt finished without caching).
+    /// `Some(Failed)` = still in flight when the timeout expired.
     pub fn wait(&self, raw: &str, timeout: Duration) -> Option<Judgement> {
         let deadline = Instant::now() + timeout;
         let mut state = self.state.lock().ok()?;
@@ -159,11 +173,17 @@ impl Prefetcher {
         None
     }
 
-    /// Judge synchronously (used when nothing was prefetched) and remember the result.
+    /// Judge synchronously (used when nothing was prefetched). Success is cached;
+    /// failure is not, so the next call can retry.
     pub fn judge_now(&self, raw: &str, judge: &Judge) -> Judgement {
         let judgement = judge_segments(raw, judge);
         if let Ok(mut state) = self.state.lock() {
-            state.store(raw.to_string(), judgement.clone());
+            match &judgement {
+                Judgement::Chosen(segments) => {
+                    state.store_chosen(raw.to_string(), segments.clone());
+                }
+                Judgement::Failed => state.finish_in_flight(raw),
+            }
         }
         judgement
     }
@@ -219,17 +239,16 @@ mod tests {
     }
 
     #[test]
-    fn failed_judge_is_remembered() {
+    fn failed_judge_is_not_cached() {
         let p = leak();
         let none: Arc<Judge> = Arc::new(|_: &str, _: &[String]| None);
         assert_eq!(
             p.judge_now("gitpullshitara", none.as_ref()),
             Judgement::Failed
         );
-        assert_eq!(
-            p.wait("gitpullshitara", Duration::ZERO),
-            Some(Judgement::Failed)
-        );
+        // A failure must not stick: the next wait reports "never requested"
+        // so the IME can fall back to plain azooKey and retry later.
+        assert_eq!(p.wait("gitpullshitara", Duration::ZERO), None);
     }
 
     #[test]
@@ -270,9 +289,9 @@ mod tests {
     #[test]
     fn cache_is_bounded() {
         let p = leak();
-        let none: Arc<Judge> = Arc::new(|_: &str, _: &[String]| None);
+        let first: Arc<Judge> = Arc::new(|_: &str, _: &[String]| Some(0));
         for i in 0..(MAX_ENTRIES + 10) {
-            p.judge_now(&format!("x{i}"), none.as_ref());
+            p.judge_now(&format!("x{i}"), first.as_ref());
         }
         let state = p.state.lock().unwrap();
         assert_eq!(state.done.len(), MAX_ENTRIES);

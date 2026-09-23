@@ -1,5 +1,5 @@
 use crate::dict::{best_japanese, EN_WORDS, PROPER};
-use crate::romaji::{map_commit_punct, particle_from_romaji, to_ime_kana};
+use crate::romaji::{hard_leftovers, map_commit_punct, particle_from_romaji, to_ime_kana};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
@@ -43,7 +43,8 @@ struct Choice {
 }
 
 const PARTICLE_PREFERRED: &[&str] = &[
-    "no", "to", "wa", "ha", "ga", "ni", "de", "wo", "o", "mo", "kara", "made", "node", "kedo",
+    "no", "to", "wa", "ha", "ga", "ni", "de", "wo", "o", "mo", "tte", "kara", "made", "node",
+    "kedo",
 ];
 
 fn english_surface(word: &str, original: &str) -> String {
@@ -71,6 +72,81 @@ fn segment_chunk(chunk: &str, extra_en: &HashSet<String>) -> Vec<Segment> {
     let is_en = |word: &str| -> bool {
         EN_WORDS.contains(word) || PROPER.contains_key(word) || extra_en.contains(word)
     };
+    // Letters that cannot be read as romaji mark words outside the lexicon
+    // ("kubernetes", "deploy") as likely English. A guess covers one leftover
+    // cluster (leftovers with only a few letters between them), extended back
+    // to the start of the letter run — not the whole chunk, so "nosettei" stays Japanese.
+    let hard = hard_leftovers(chunk);
+    let guess_runs: Vec<(usize, usize)> = {
+        let mut runs = Vec::new();
+        let mut cluster: Vec<usize> = Vec::new();
+        let particle_between = |from: usize, to: usize| -> bool {
+            // Only a particle that starts immediately after the previous leftover
+            // (as in "…form wo apply"), not a letter inside the English word.
+            const SPLITTERS: &[&str] = &[
+                "wo", "no", "to", "wa", "ga", "ni", "de", "mo", "tte", "kara", "made", "node",
+                "kedo",
+            ];
+            for &p in SPLITTERS {
+                let plen = p.chars().count();
+                if from + plen > to {
+                    continue;
+                }
+                let slice: String = chars[from..from + plen].iter().collect();
+                if slice == p {
+                    return true;
+                }
+            }
+            false
+        };
+        let flush = |cluster: &mut Vec<usize>, runs: &mut Vec<(usize, usize)>| {
+            let Some(&first) = cluster.first() else {
+                return;
+            };
+            let last = *cluster.last().unwrap();
+            let min_start = runs.last().map(|&(_, e)| e).unwrap_or(0);
+            let mut start = first;
+            while start > min_start && chars[start - 1].is_ascii_lowercase() {
+                start -= 1;
+            }
+            // Don't absorb a particle that sits between the previous run and this word.
+            for &p in PARTICLE_PREFERRED {
+                let plen = p.chars().count();
+                if start + plen <= first {
+                    let slice: String = chars[start..start + plen].iter().collect();
+                    if slice == p {
+                        start += plen;
+                        break;
+                    }
+                }
+            }
+            // Include a trailing pending syllable ("…ply") so the full English
+            // word is guessed, not a stump like "app" + "ly".
+            let mut end = last + 1;
+            while end < n
+                && chars[end].is_ascii_lowercase()
+                && !"aiueo".contains(chars[end])
+                && end - last <= 2
+            {
+                end += 1;
+            }
+            if end - start >= 3 {
+                runs.push((start, end));
+            }
+            cluster.clear();
+        };
+        for &p in &hard {
+            if let Some(&prev) = cluster.last() {
+                // A large readable gap, or a particle (wo/no/to…), means a new word.
+                if p > prev + 6 || particle_between(prev + 1, p) {
+                    flush(&mut cluster, &mut runs);
+                }
+            }
+            cluster.push(p);
+        }
+        flush(&mut cluster, &mut runs);
+        runs
+    };
     fn relax(score: &mut [i32], choice: &mut [Option<Choice>], end: usize, total: i32, c: Choice) {
         if total > score[end] {
             score[end] = total;
@@ -84,11 +160,27 @@ fn segment_chunk(chunk: &str, extra_en: &HashSet<String>) -> Vec<Segment> {
         }
         let prev_kind = choice[i].as_ref().map(|c| c.kind);
         let rest: String = chars[i..].iter().collect();
+        let known_start = (2..=(n - i).min(24)).any(|len| {
+            let word: String = chars[i..i + len].iter().collect();
+            is_en(&word)
+        });
 
         for len in (2..=(n - i).min(24)).rev() {
             let word: String = chars[i..i + len].iter().collect();
-            if !word.chars().all(|c| c.is_ascii_lowercase()) || !is_en(&word) {
+            if !word.chars().all(|c| c.is_ascii_lowercase()) {
                 continue;
+            }
+            let known = is_en(&word);
+            if !known {
+                // Only the full leftover-containing run, never a substring or a
+                // neighbor of a known English word (which would insert a space).
+                let guessable = len >= 3
+                    && guess_runs.contains(&(i, i + len))
+                    && !matches!(prev_kind, Some(Kind::En))
+                    && !known_start;
+                if !guessable {
+                    continue;
+                }
             }
             let typed: String = original[i..i + len].iter().collect();
             let acronym = typed.chars().all(|c| c.is_ascii_uppercase());
@@ -98,14 +190,43 @@ fn segment_chunk(chunk: &str, extra_en: &HashSet<String>) -> Vec<Segment> {
             if len <= 2 && !acronym && !matches!(prev_kind, Some(Kind::En)) {
                 continue;
             }
-            let mut sc = 40 + (len as i32) * 12;
+            let word_hard = hard_leftovers(&word);
+            // Short stems like "set"/"get" are valid romaji too. Prefer Japanese unless
+            // more English or a particle follows ("getの", "setを"). Longer known words
+            // ("data", "your") stay English.
+            let ambiguous_stem = known
+                && !acronym
+                && !PROPER.contains_key(word.as_str())
+                && !extra_en.contains(&word)
+                && !matches!(prev_kind, Some(Kind::En))
+                && word_hard.iter().all(|&p| p + 2 >= len);
+            if ambiguous_stem && len <= 3 {
+                let after = i + len;
+                let continues_en = (2..=(n - after).min(24)).any(|l| {
+                    let w: String = chars[after..after + l].iter().collect();
+                    is_en(&w) && !PARTICLE_PREFERRED.contains(&w.as_str())
+                });
+                let continues_particle = (1..=(n - after).min(4)).any(|l| {
+                    let w: String = chars[after..after + l].iter().collect();
+                    particle_from_romaji(&w).is_some()
+                });
+                if !continues_en && !continues_particle {
+                    continue;
+                }
+            }
+            let mut sc = if known {
+                40 + (len as i32) * 12
+            } else {
+                // Prefer the full run over any Japanese reading of the same letters.
+                80 + (len as i32) * 20
+            };
             if PROPER.contains_key(word.as_str()) || extra_en.contains(&word) {
                 sc += 55;
             }
             if typed.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
                 sc += 35;
             }
-            if len >= 4 {
+            if known && len >= 4 {
                 sc += 30;
             }
             let c = Choice {
@@ -144,7 +265,7 @@ fn segment_chunk(chunk: &str, extra_en: &HashSet<String>) -> Vec<Segment> {
             if matches!(prev_kind, Some(Kind::En)) {
                 sc += 50;
             }
-            if matches!(slice.as_str(), "no" | "to" | "wo") {
+            if matches!(slice.as_str(), "no" | "to" | "wo" | "tte") {
                 sc += 30;
             }
             if matches!(prev_kind, Some(Kind::En)) && i + len == n {
@@ -491,6 +612,8 @@ mod tests {
             shape("yoursessionhasexpiredto"),
             vec![en("yoursessionhasexpired"), ja("to")]
         );
+        assert_eq!(shape("datatte"), vec![en("data"), ja("tte")]);
+        assert_eq!(live_convert("datatte").surface, "dataって");
         assert_eq!(
             shape("sukoshimattekudasai."),
             vec![ja("sukoshimattekudasai"), other(".")]
@@ -512,6 +635,38 @@ mod tests {
         assert_eq!(shape("ra-men"), vec![ja("ra-men")]);
         assert_eq!(shape("nak"), vec![ja("nak")]);
         assert!(!live_convert("ra-men").surface.contains(' '));
+    }
+
+    #[test]
+    fn words_outside_the_lexicon_are_found_by_unreadable_romaji() {
+        assert_eq!(
+            shape("kubernetesnosettei"),
+            vec![en("kubernetes"), ja("nosettei")]
+        );
+        assert_eq!(
+            shape("terraformwoapply"),
+            vec![en("terraform"), ja("wo"), en("apply")]
+        );
+    }
+
+    #[test]
+    fn readable_japanese_stays_japanese() {
+        for raw in [
+            "fairuwohiraku",
+            "matchawonomu",
+            "chekkushite",
+            "konnnichiha",
+            "sakkaa",
+            "thi-shatsu",
+            "kyouhaiitenk",
+            "xtukoshi",
+        ] {
+            assert!(
+                segment(raw).iter().all(|s| s.kind != SegmentKind::En),
+                "{raw}: {:?}",
+                segment(raw)
+            );
+        }
     }
 
     #[test]

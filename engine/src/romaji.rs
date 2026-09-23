@@ -43,6 +43,56 @@ static MAP: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
         ("tt", "っt"),
         ("pp", "っp"),
         ("cc", "っc"),
+        ("gg", "っg"),
+        ("zz", "っz"),
+        ("dd", "っd"),
+        ("bb", "っb"),
+        ("hh", "っh"),
+        ("ff", "っf"),
+        ("jj", "っj"),
+        // Not rr/yy/ww/vv/mm: those make English (review, pull…) look like Japanese.
+        ("tc", "っc"),
+        ("fa", "ふぁ"),
+        ("fi", "ふぃ"),
+        ("fe", "ふぇ"),
+        ("fo", "ふぉ"),
+        ("va", "ゔぁ"),
+        ("vi", "ゔぃ"),
+        ("vu", "ゔ"),
+        ("ve", "ゔぇ"),
+        ("vo", "ゔぉ"),
+        ("che", "ちぇ"),
+        ("she", "しぇ"),
+        ("je", "じぇ"),
+        ("thi", "てぃ"),
+        ("dhi", "でぃ"),
+        ("dyu", "でゅ"),
+        ("wi", "うぃ"),
+        ("we", "うぇ"),
+        ("ye", "いぇ"),
+        ("tsa", "つぁ"),
+        ("xtu", "っ"),
+        ("xa", "ぁ"),
+        ("xi", "ぃ"),
+        ("xu", "ぅ"),
+        ("xe", "ぇ"),
+        ("xo", "ぉ"),
+        ("xya", "ゃ"),
+        ("xyu", "ゅ"),
+        ("xyo", "ょ"),
+        ("sya", "しゃ"),
+        ("syu", "しゅ"),
+        ("syo", "しょ"),
+        ("tya", "ちゃ"),
+        ("tyu", "ちゅ"),
+        ("tyo", "ちょ"),
+        ("jya", "じゃ"),
+        ("jyu", "じゅ"),
+        ("jyo", "じょ"),
+        ("zya", "じゃ"),
+        ("zyu", "じゅ"),
+        ("zyo", "じょ"),
+        ("nyi", "にぃ"),
         ("ka", "か"),
         ("ki", "き"),
         ("ku", "く"),
@@ -137,53 +187,74 @@ fn to_katakana_str(s: &str) -> String {
         .collect()
 }
 
-/// Convert romaji with IME leftover (incomplete trailing latin kept).
-pub fn to_ime_kana(romaji: &str, prefer_katakana: bool) -> String {
-    let lower = romaji.to_lowercase();
-    let bytes = lower.as_bytes();
+/// Romaji → kana, reporting which input positions could not be read as romaji.
+/// Non-ASCII input is passed through untouched.
+fn scan(romaji: &str) -> (String, Vec<usize>) {
+    let lower: Vec<char> = romaji.to_lowercase().chars().collect();
     let mut i = 0;
     let mut out = String::new();
-    while i < bytes.len() {
-        let mut matched = false;
+    let mut leftovers = Vec::new();
+    'outer: while i < lower.len() {
         for len in (1..=3).rev() {
-            if i + len > bytes.len() {
+            if i + len > lower.len() {
                 continue;
             }
-            let slice = std::str::from_utf8(&bytes[i..i + len]).unwrap_or("");
-            if let Some(kana) = MAP.get(slice) {
-                // special: っk style — emit っ and keep consonant for next
-                if kana.starts_with('っ') && kana.len() > 3 {
+            let slice: String = lower[i..i + len].iter().collect();
+            if let Some(kana) = MAP.get(slice.as_str()) {
+                // "kk" style: emit っ and keep the consonant for the next syllable
+                if kana.starts_with('っ') && kana.chars().count() > 1 {
                     out.push('っ');
-                    // leave the repeated consonant for next iteration by only consuming 1
                     i += 1;
                 } else {
                     out.push_str(kana);
                     i += len;
                 }
-                matched = true;
-                break;
+                continue 'outer;
             }
         }
-        if !matched {
-            // lone n before consonant → ん
-            if bytes[i] == b'n' && i + 1 < bytes.len() {
-                let next = bytes[i + 1] as char;
-                if !"aiueoy".contains(next) {
-                    out.push('ん');
-                    i += 1;
-                    continue;
-                }
-            }
-            // leftover latin
-            out.push(bytes[i] as char);
+        // lone n before a consonant → ん
+        if lower[i] == 'n' && i + 1 < lower.len() && !"aiueoy".contains(lower[i + 1]) {
+            out.push('ん');
             i += 1;
+            continue;
         }
+        if lower[i].is_ascii_alphabetic() {
+            leftovers.push(i);
+        }
+        out.push(lower[i]);
+        i += 1;
     }
+    (out, leftovers)
+}
+
+/// Convert romaji with IME leftover (incomplete trailing latin kept).
+pub fn to_ime_kana(romaji: &str, prefer_katakana: bool) -> String {
+    let (out, _) = scan(romaji);
     if prefer_katakana {
         to_katakana_str(&out)
     } else {
         out
     }
+}
+
+/// Positions of letters that cannot be read as romaji, ignoring a trailing
+/// consonant run of up to two letters (a syllable still being typed, "…tenk").
+/// Japanese typed in romaji almost never has any; English words usually do
+/// ("pull", "review", "kubernetes").
+pub fn hard_leftovers(romaji: &str) -> Vec<usize> {
+    let chars: Vec<char> = romaji.chars().collect();
+    let pending = chars
+        .iter()
+        .rev()
+        .take_while(|c| c.is_ascii_alphabetic() && !"aiueo".contains(c.to_ascii_lowercase()))
+        .count()
+        .min(2);
+    let pending_start = chars.len() - pending;
+    scan(romaji)
+        .1
+        .into_iter()
+        .filter(|&i| i < pending_start)
+        .collect()
 }
 
 pub fn particle_from_romaji(romaji: &str) -> Option<&'static str> {
@@ -205,7 +276,41 @@ pub fn particle_from_romaji(romaji: &str) -> Option<&'static str> {
         "made" => Some("まで"),
         "node" => Some("ので"),
         "kedo" => Some("けど"),
+        "tte" => Some("って"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hard_leftovers_mark_unreadable_letters() {
+        assert_eq!(hard_leftovers("kubernetesno"), vec![4, 9]);
+        assert_eq!(
+            hard_leftovers("kubernetes"),
+            vec![4],
+            "trailing s may still be typed"
+        );
+        assert!(!hard_leftovers("pullshitara").is_empty());
+        assert!(!hard_leftovers("reviewwo").is_empty());
+    }
+
+    #[test]
+    fn pending_syllable_is_not_unreadable() {
+        assert!(hard_leftovers("kyouhaiitenk").is_empty());
+        assert!(hard_leftovers("tenky").is_empty());
+        assert!(hard_leftovers("fairu").is_empty());
+        assert!(hard_leftovers("matcha").is_empty());
+    }
+
+    #[test]
+    fn extended_romaji() {
+        assert_eq!(to_ime_kana("fairu", false), "ふぁいる");
+        assert_eq!(to_ime_kana("matcha", false), "まっちゃ");
+        assert_eq!(to_ime_kana("thi-shatsu", false), "てぃーしゃつ");
+        assert_eq!(to_ime_kana("baggu", false), "ばっぐ");
     }
 }
 

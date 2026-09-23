@@ -35,7 +35,7 @@ pub static EN_WORDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
         "review", "issue", "build", "test", "debug", "deploy", "status", "message", "file", "code",
         "and", "the", "with", "from", "this", "that", "have", "been", "will", "can", "not", "are",
         "was", "were", "but", "all", "any", "new", "old", "get", "set", "put", "run", "use", "try",
-        "ok", "ng", "yes", "no",
+        "ok", "ng", "yes", "no", "terraform", "apply", "kubernetes", "data",
     ]
     .into_iter()
     .collect();

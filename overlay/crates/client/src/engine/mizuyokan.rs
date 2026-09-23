@@ -9,7 +9,7 @@
 use std::{
     path::PathBuf,
     sync::{LazyLock, Mutex},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::Result;
@@ -22,6 +22,10 @@ use super::{
 };
 
 const SETTINGS_FILENAME: &str = "mizuyokan.json";
+/// Defaults match karukan's idea of adaptive degrade: a few bad calls and we
+/// stop waiting on the enhancement layer so typing stays on plain azooKey.
+const JEV_FAIL_THRESHOLD_DEFAULT: u32 = 3;
+const JEV_COOLDOWN_DEFAULT: Duration = Duration::from_secs(60);
 
 /// Kept apart from azooKey's settings.json, which the launcher rewrites
 /// without the keys it does not know.
@@ -34,6 +38,10 @@ pub struct Settings {
     pub jev_model: String,
     pub jev_endpoint: String,
     pub jev_timeout_ms: u64,
+    /// Consecutive API / timeout failures before Jev is paused (karukan-style degrade).
+    pub jev_fail_threshold: u32,
+    /// How long to stay on plain azooKey after the threshold is hit (ms).
+    pub jev_cooldown_ms: u64,
     /// Append decisions to mizuyokan.log. Off by default: the log contains typed text.
     pub debug_log: bool,
 }
@@ -46,6 +54,8 @@ impl Default for Settings {
             jev_model: "typesafe/jev-latest".to_string(),
             jev_endpoint: "https://ai-gateway.lolipop.jp/v1/systemone".to_string(),
             jev_timeout_ms: 1500,
+            jev_fail_threshold: JEV_FAIL_THRESHOLD_DEFAULT,
+            jev_cooldown_ms: JEV_COOLDOWN_DEFAULT.as_millis() as u64,
             debug_log: false,
         }
     }
@@ -75,10 +85,23 @@ impl Settings {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct Loaded {
     config: Option<JevConfig>,
+    fail_threshold: u32,
+    cooldown: Duration,
     debug_log: bool,
+}
+
+impl Default for Loaded {
+    fn default() -> Self {
+        Self {
+            config: None,
+            fail_threshold: JEV_FAIL_THRESHOLD_DEFAULT,
+            cooldown: JEV_COOLDOWN_DEFAULT,
+            debug_log: false,
+        }
+    }
 }
 
 /// mizuyokan.json as seen by this process. Consulted on every keystroke, so
@@ -107,6 +130,8 @@ fn loaded() -> Loaded {
         .unwrap_or_default();
     let loaded = Loaded {
         config: settings.jev_config(),
+        fail_threshold: settings.jev_fail_threshold.max(1),
+        cooldown: Duration::from_millis(settings.jev_cooldown_ms.max(1)),
         debug_log: settings.debug_log,
     };
     *cache = Some((modified, loaded.clone()));
@@ -158,6 +183,84 @@ macro_rules! debug_log {
     };
 }
 
+struct Circuit {
+    failures: u32,
+    open_until: Option<Instant>,
+}
+
+impl Circuit {
+    fn usable(&mut self) -> bool {
+        if let Some(until) = self.open_until {
+            if Instant::now() < until {
+                return false;
+            }
+            // Cooldown over: allow a probe call.
+            self.open_until = None;
+            self.failures = 0;
+        }
+        true
+    }
+
+    fn success(&mut self) {
+        self.failures = 0;
+        self.open_until = None;
+    }
+
+    fn failure(&mut self, threshold: u32, cooldown: Duration) {
+        self.failures = self.failures.saturating_add(1);
+        if self.failures >= threshold {
+            self.open_until = Some(Instant::now() + cooldown);
+            self.failures = 0;
+        }
+    }
+}
+
+fn circuit() -> std::sync::MutexGuard<'static, Circuit> {
+    static CIRCUIT: LazyLock<Mutex<Circuit>> = LazyLock::new(|| {
+        Mutex::new(Circuit {
+            failures: 0,
+            open_until: None,
+        })
+    });
+    CIRCUIT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Active Jev config when the circuit is closed. `None` means plain azooKey.
+fn jev_ready() -> Option<JevConfig> {
+    let config = jev_config()?;
+    if !circuit().usable() {
+        debug_log!("jev circuit open: plain azooKey");
+        return None;
+    }
+    Some(config)
+}
+
+fn note_jev_success() {
+    circuit().success();
+}
+
+fn note_jev_failure(reason: &str) {
+    let loaded = loaded();
+    circuit().failure(loaded.fail_threshold, loaded.cooldown);
+    debug_log!("jev failure ({reason}): falling back to plain azooKey");
+}
+
+/// Jev judge that trips the circuit on API errors so background prefetch
+/// failures also switch the IME to plain azooKey after a few tries.
+fn monitored_judge(config: JevConfig) -> std::sync::Arc<mizuyokan_engine::Judge> {
+    let inner = jev_judge(config);
+    std::sync::Arc::new(move |raw: &str, options: &[String]| match inner(raw, options) {
+        Some(i) => {
+            note_jev_success();
+            Some(i)
+        }
+        None => {
+            note_jev_failure("api");
+            None
+        }
+    })
+}
+
 mod dpapi {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use windows::Win32::{
@@ -195,12 +298,12 @@ pub fn prefetch(raw: &str) {
     if raw.chars().filter(|c| c.is_ascii_alphabetic()).count() < 2 {
         return;
     }
-    match jev_config() {
+    match jev_ready() {
         Some(config) => {
             debug_log!("prefetch {raw:?}");
-            Prefetcher::global().request(raw, jev_judge(config));
+            Prefetcher::global().request(raw, monitored_judge(config));
         }
-        None => debug_log!("prefetch {raw:?} skipped: no usable key"),
+        None => debug_log!("prefetch {raw:?} skipped: no usable Jev"),
     }
 }
 
@@ -261,29 +364,57 @@ pub fn display(mut candidates: Candidates, segments: &[Segment]) -> Candidates {
 /// Segmentation to feed azooKey, or `None` for a plain azooKey feed.
 /// While typing (`settle == false`) only finished judgements are used; on Space /
 /// Enter the judgement of the whole buffer is awaited when it may hold English.
+/// Any Jev API / timeout failure returns `None` so the IME stays on plain azooKey.
 fn target_segments(raw: &str, settle: bool) -> Option<Vec<Segment>> {
-    let config = jev_config()?;
+    let config = jev_ready()?;
     let prefetcher = Prefetcher::global();
     if settle && looks_mixed(raw) {
         let started = std::time::Instant::now();
         let judgement = match prefetcher.wait(raw, config.timeout) {
-            Some(j) => j,
-            None => prefetcher.judge_now(raw, jev_judge(config).as_ref()),
+            Some(Judgement::Chosen(segments)) => Judgement::Chosen(segments),
+            Some(Judgement::Failed) => {
+                // Prefetch still running past the deadline: do not block typing
+                // on a second call; plain azooKey until the circuit cools down.
+                note_jev_failure("timeout waiting for prefetch");
+                return None;
+            }
+            None => prefetcher.judge_now(raw, monitored_judge(config).as_ref()),
         };
         debug_log!("settle {raw:?}: {judgement:?} after {:?}", started.elapsed());
-        if let Judgement::Chosen(segments) = judgement {
-            return segments
-                .iter()
-                .any(|s| s.kind == SegmentKind::En)
-                .then_some(segments);
-        }
+        return match judgement {
+            Judgement::Chosen(segments) if segments.iter().any(|s| s.kind == SegmentKind::En) => {
+                Some(segments)
+            }
+            // Japanese-only, or API failed (already counted by monitored_judge).
+            _ => None,
+        };
     }
     prefetcher.confirmed(raw)
+}
+
+fn feed_azookey(
+    ipc: &mut IPCService,
+    raw: &str,
+    segments: Option<&[Segment]>,
+) -> Result<Candidates> {
+    ipc.clear_text()?;
+    let feed = match segments {
+        Some(segments) => feed_for(segments),
+        None => to_fullwidth(raw, false),
+    };
+    let candidates = ipc.append_text(feed)?;
+    Ok(match segments {
+        Some(segments) => display(candidates, segments),
+        None => candidates,
+    })
 }
 
 /// Bring azooKey's composing text in line with the current judgement of `raw`.
 /// Returns the new candidates and segmentation (`None` = plain feed), or `None`
 /// when azooKey already holds a plain feed that needs no change.
+///
+/// Never returns `Err` for Jev problems: API errors fall back to plain azooKey
+/// so a dead gateway cannot break typing.
 pub fn sync(
     raw: &str,
     was_mixed: bool,
@@ -291,23 +422,41 @@ pub fn sync(
     settle: bool,
 ) -> Result<Option<(Candidates, Option<Vec<Segment>>)>> {
     match target_segments(raw, settle) {
-        Some(segments) => {
-            ipc.clear_text()?;
-            let candidates = ipc.append_text(feed_for(&segments))?;
-            let candidates = display(candidates, &segments);
-            debug_log!(
-                "sync {raw:?} settle={settle}: {:?}",
-                candidates.texts.first().map(|t| format!("{t}{}", candidates.sub_texts[0]))
-            );
-            Ok(Some((candidates, Some(segments))))
-        }
-        None if was_mixed => {
-            ipc.clear_text()?;
-            let candidates = ipc.append_text(to_fullwidth(raw, false))?;
-            debug_log!("sync {raw:?} settle={settle}: back to plain azooKey");
-            Ok(Some((candidates, None)))
-        }
+        Some(segments) => match feed_azookey(ipc, raw, Some(&segments)) {
+            Ok(candidates) => {
+                debug_log!(
+                    "sync {raw:?} settle={settle}: {:?}",
+                    candidates
+                        .texts
+                        .first()
+                        .map(|t| format!("{t}{}", candidates.sub_texts.first().cloned().unwrap_or_default()))
+                );
+                Ok(Some((candidates, Some(segments))))
+            }
+            Err(e) => {
+                debug_log!("sync mixed feed failed ({e:?}), plain azooKey");
+                Ok(restore_plain(ipc, raw, settle))
+            }
+        },
+        None if was_mixed => Ok(restore_plain(ipc, raw, settle)),
         None => Ok(None),
+    }
+}
+
+fn restore_plain(
+    ipc: &mut IPCService,
+    raw: &str,
+    log_settle: bool,
+) -> Option<(Candidates, Option<Vec<Segment>>)> {
+    match feed_azookey(ipc, raw, None) {
+        Ok(candidates) => {
+            debug_log!("sync {raw:?} settle={log_settle}: back to plain azooKey");
+            Some((candidates, None))
+        }
+        Err(e) => {
+            debug_log!("sync plain restore failed ({e:?}): leave azooKey as-is");
+            None
+        }
     }
 }
 
@@ -423,6 +572,8 @@ mod tests {
         let parsed = Settings::parse(r#"{"jev_timeout_ms": 900}"#);
         assert!(parsed.enable);
         assert_eq!(parsed.jev_timeout_ms, 900);
+        assert_eq!(parsed.jev_fail_threshold, 3);
+        assert_eq!(parsed.jev_cooldown_ms, 60_000);
         assert_eq!(parsed.jev_model, "typesafe/jev-latest");
         assert_eq!(Settings::parse("{ not json"), Settings::default());
         assert!(Settings::default().jev_config().is_none());
