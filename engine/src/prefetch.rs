@@ -6,18 +6,19 @@
 //! telling English from romaji does not need kanji.
 
 use std::{
-    collections::{HashMap, VecDeque},
-    sync::{Arc, Condvar, LazyLock, Mutex},
+    collections::{HashMap, HashSet, VecDeque},
+    sync::{Arc, Condvar, LazyLock, Mutex, RwLock},
     time::{Duration, Instant},
 };
 
 use crate::{
-    convert::{alternatives, as_japanese, concat, render_offline, Segment, SegmentKind},
+    convert::{alternatives_with, as_japanese, concat, render_offline, segment_with, Segment, SegmentKind},
     jev::{JevClient, JevConfig},
 };
 
 const MAX_ALTERNATIVES: usize = 8;
 const MAX_ENTRIES: usize = 64;
+const MAX_LEARNED: usize = 5000;
 
 /// Outcome of judging one raw buffer.
 #[derive(Debug, Clone, PartialEq)]
@@ -62,13 +63,20 @@ impl State {
 pub struct Prefetcher {
     state: Mutex<State>,
     ready: Condvar,
+    /// English words confirmed by past commits; treated like the built-in lexicon.
+    learned: RwLock<HashSet<String>>,
 }
 
 /// Picks one of `options` (rendered texts); `None` when no decision could be made.
 pub type Judge = dyn Fn(&str, &[String]) -> Option<usize> + Send + Sync;
 
 pub fn judge_segments(raw: &str, judge: &Judge) -> Judgement {
-    let options = alternatives(raw, MAX_ALTERNATIVES);
+    judge_segments_with(raw, &HashSet::new(), judge)
+}
+
+/// [`judge_segments`] with extra known English words.
+pub fn judge_segments_with(raw: &str, extra_en: &HashSet<String>, judge: &Judge) -> Judgement {
+    let options = alternatives_with(raw, MAX_ALTERNATIVES, extra_en);
     if options.len() < 2 {
         return Judgement::Chosen(options.into_iter().next().unwrap_or_default());
     }
@@ -97,7 +105,28 @@ impl Prefetcher {
         Self {
             state: Mutex::new(State::default()),
             ready: Condvar::new(),
+            learned: RwLock::new(HashSet::new()),
         }
+    }
+
+    pub fn learned(&self) -> HashSet<String> {
+        self.learned.read().map(|l| l.clone()).unwrap_or_default()
+    }
+
+    /// Add English words (lowercase); returns the ones that were new.
+    pub fn remember(&self, words: impl IntoIterator<Item = String>) -> Vec<String> {
+        let Ok(mut learned) = self.learned.write() else {
+            return Vec::new();
+        };
+        words
+            .into_iter()
+            .filter(|w| learned.len() < MAX_LEARNED && learned.insert(w.clone()))
+            .collect()
+    }
+
+    /// Offline segmentation that also knows the learned words.
+    pub fn segment(&self, raw: &str) -> Vec<Segment> {
+        segment_with(raw, &self.learned())
     }
 
     pub fn global() -> &'static Prefetcher {
@@ -118,7 +147,7 @@ impl Prefetcher {
         }
         let raw = raw.to_string();
         std::thread::spawn(move || {
-            let judgement = judge_segments(&raw, judge.as_ref());
+            let judgement = judge_segments_with(&raw, &self.learned(), judge.as_ref());
             if let Ok(mut state) = self.state.lock() {
                 match judgement {
                     Judgement::Chosen(segments) => state.store_chosen(raw, segments),
@@ -150,10 +179,8 @@ impl Prefetcher {
         }
     }
 
-    /// Segmentation to show while typing, without waiting: the longest prefix of
-    /// `raw` that Jev judged to contain English, with the rest read as Japanese.
-    /// `None` when no judged prefix contains English (plain kana-kanji conversion).
-    pub fn confirmed(&self, raw: &str) -> Option<Vec<Segment>> {
+    /// The longest judged prefix of `raw`: its byte length and segmentation.
+    fn judged_prefix(&self, raw: &str) -> Option<(usize, Vec<Segment>)> {
         let state = self.state.lock().ok()?;
         let boundaries: Vec<usize> = raw
             .char_indices()
@@ -161,22 +188,54 @@ impl Prefetcher {
             .skip(1)
             .chain(std::iter::once(raw.len()))
             .collect();
-        for &end in boundaries.iter().rev() {
-            let Some(Judgement::Chosen(segments)) = state.done.get(&raw[..end]) else {
-                continue;
-            };
-            if !segments.iter().any(|s| s.kind == SegmentKind::En) {
-                return None;
-            }
-            return Some(concat(segments.clone(), as_japanese(&raw[end..])));
+        boundaries.iter().rev().find_map(|&end| match state.done.get(&raw[..end]) {
+            Some(Judgement::Chosen(segments)) => Some((end, segments.clone())),
+            _ => None,
+        })
+    }
+
+    /// Segmentation to show while typing, without waiting: the longest prefix of
+    /// `raw` that Jev judged to contain English, with the rest read as Japanese.
+    /// `None` when no judged prefix contains English (plain kana-kanji conversion).
+    pub fn confirmed(&self, raw: &str) -> Option<Vec<Segment>> {
+        let (end, segments) = self.judged_prefix(raw)?;
+        if !segments.iter().any(|s| s.kind == SegmentKind::En) {
+            return None;
         }
-        None
+        Some(concat(segments, as_japanese(&raw[end..])))
+    }
+
+    /// Like [`Self::confirmed`], but while Jev has not answered for the
+    /// English part yet, show the offline guess instead of plain kana: without
+    /// it English is always garbled until the answer arrives. A judged prefix
+    /// still wins: offline English is used only where it starts after it.
+    pub fn live(&self, raw: &str) -> Option<Vec<Segment>> {
+        let judged = self.judged_prefix(raw);
+        if let Some((_, segments)) = &judged {
+            if segments.iter().any(|s| s.kind == SegmentKind::En) {
+                return self.confirmed(raw);
+            }
+        }
+        let judged_end = judged.map_or(0, |(end, _)| raw[..end].chars().count());
+        let offline = self.segment(raw);
+        let mut pos = 0;
+        let mut has_en = false;
+        for s in &offline {
+            if s.kind == SegmentKind::En {
+                if pos < judged_end {
+                    return None;
+                }
+                has_en = true;
+            }
+            pos += s.raw.chars().count();
+        }
+        has_en.then_some(offline)
     }
 
     /// Judge synchronously (used when nothing was prefetched). Success is cached;
     /// failure is not, so the next call can retry.
     pub fn judge_now(&self, raw: &str, judge: &Judge) -> Judgement {
-        let judgement = judge_segments(raw, judge);
+        let judgement = judge_segments_with(raw, &self.learned(), judge);
         if let Ok(mut state) = self.state.lock() {
             match &judgement {
                 Judgement::Chosen(segments) => {
@@ -265,13 +324,37 @@ mod tests {
         assert_eq!(render_offline(&longer), "git pullしたら");
         assert_eq!(longer.last().unwrap().raw, "shitara");
 
-        let japanese_only: Arc<Judge> = Arc::new(|_: &str, options: &[String]| {
-            options
-                .iter()
-                .position(|o| o.is_ascii() == false && !o.contains("git"))
-        });
-        p.judge_now("gitpullshitar", japanese_only.as_ref());
+        judged_japanese(p, "gitpullshitar");
         assert_eq!(p.confirmed("gitpullshitara"), None);
+    }
+
+    /// As if Jev had picked the all-Japanese reading of `raw`.
+    fn judged_japanese(p: &Prefetcher, raw: &str) {
+        p.state
+            .lock()
+            .unwrap()
+            .store_chosen(raw.to_string(), as_japanese(raw));
+    }
+
+    #[test]
+    fn live_shows_offline_english_until_jev_answers() {
+        let p = leak();
+        // Nothing judged yet: the offline guess instead of garbled kana.
+        assert_eq!(render_offline(&p.live("gitpullshitara").unwrap()), "git pullしたら");
+        // Offline Japanese stays plain azooKey.
+        assert_eq!(p.live("sukoshimatte"), None);
+
+        // Jev said the start is Japanese: offline English inside it is not shown…
+        judged_japanese(p, "gitpu");
+        assert_eq!(p.live("gitpullshitara"), None);
+        // …but English typed after the judged part is.
+        judged_japanese(p, "kyouha");
+        let shown = p.live("kyouhagitpull").unwrap();
+        assert_eq!(shown.last().unwrap().kind, SegmentKind::En);
+
+        // A judgement with English is used as before.
+        p.judge_now("gitpullshi", prefer_english().as_ref());
+        assert_eq!(p.live("gitpullshitara"), p.confirmed("gitpullshitara"));
     }
 
     #[test]
@@ -284,6 +367,29 @@ mod tests {
 
     fn prefer_english_acronym() -> Arc<Judge> {
         Arc::new(|_: &str, options: &[String]| options.iter().position(|o| o.starts_with("PR")))
+    }
+
+    #[test]
+    fn learned_words_shape_the_options() {
+        let p = leak();
+        assert_eq!(p.remember(["figma".to_string()]), vec!["figma".to_string()]);
+        assert!(p.remember(["figma".to_string()]).is_empty());
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let record = seen.clone();
+        let first: Arc<Judge> = Arc::new(move |_: &str, options: &[String]| {
+            *record.lock().unwrap() = options.to_vec();
+            Some(0)
+        });
+        let Judgement::Chosen(segments) = p.judge_now("Figmanodezain", first.as_ref()) else {
+            panic!("no judgement");
+        };
+        assert_eq!(segments[0].raw, "Figma");
+        assert_eq!(p.segment("figmanodezain")[0].kind, SegmentKind::En);
+        // Often nothing else is plausible and Jev is not even asked.
+        let options = seen.lock().unwrap().clone();
+        if let Some(first) = options.first() {
+            assert!(first.starts_with("Figmaの"));
+        }
     }
 
     #[test]

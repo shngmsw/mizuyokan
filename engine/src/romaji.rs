@@ -189,7 +189,7 @@ fn to_katakana_str(s: &str) -> String {
 
 /// Romaji → kana, reporting which input positions could not be read as romaji.
 /// Non-ASCII input is passed through untouched.
-fn scan(romaji: &str) -> (String, Vec<usize>) {
+pub(crate) fn scan(romaji: &str) -> (String, Vec<usize>) {
     let lower: Vec<char> = romaji.to_lowercase().chars().collect();
     let mut i = 0;
     let mut out = String::new();

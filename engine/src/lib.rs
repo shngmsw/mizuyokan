@@ -10,12 +10,13 @@ mod convert;
 mod dict;
 mod jev;
 mod prefetch;
+mod readings;
 mod romaji;
 
 pub use convert::{
-    alternatives, live_convert, render_offline, segment, segment_with, take_committed,
-    ConvertResult, Segment, SegmentKind,
+    alternatives, alternatives_with, english_mask, live_convert, render_offline, segment,
+    segment_with, take_committed, words_to_learn, ConvertResult, Segment, SegmentKind,
 };
 pub use jev::{JevClient, JevConfig, JevError};
-pub use prefetch::{jev_judge, judge_segments, Judge, Judgement, Prefetcher};
+pub use prefetch::{jev_judge, judge_segments, judge_segments_with, Judge, Judgement, Prefetcher};
 pub use romaji::is_commit_punct;

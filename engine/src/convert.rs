@@ -47,7 +47,7 @@ const PARTICLE_PREFERRED: &[&str] = &[
     "kedo",
 ];
 
-fn english_surface(word: &str, original: &str) -> String {
+pub(crate) fn english_surface(word: &str, original: &str) -> String {
     if let Some(p) = PROPER.get(word) {
         return (*p).to_string();
     }
@@ -384,7 +384,7 @@ fn segment_chunk(chunk: &str, extra_en: &HashSet<String>) -> Vec<Segment> {
     segments
 }
 
-fn push_other(segments: &mut Vec<Segment>, raw: char, surface: char) {
+pub(crate) fn push_other(segments: &mut Vec<Segment>, raw: char, surface: char) {
     match segments.last_mut() {
         Some(last) if last.kind == SegmentKind::Other => {
             last.raw.push(raw);
@@ -477,7 +477,7 @@ pub fn concat(mut head: Vec<Segment>, tail: Vec<Segment>) -> Vec<Segment> {
     merge_adjacent(head)
 }
 
-fn merge_adjacent(segments: Vec<Segment>) -> Vec<Segment> {
+pub(crate) fn merge_adjacent(segments: Vec<Segment>) -> Vec<Segment> {
     let mut out: Vec<Segment> = Vec::new();
     for s in segments {
         match out.last_mut() {
@@ -494,25 +494,150 @@ fn merge_adjacent(segments: Vec<Segment>) -> Vec<Segment> {
     out
 }
 
+/// Which characters of the buffer a segmentation reads as English.
+pub fn english_mask(segments: &[Segment]) -> Vec<bool> {
+    segments
+        .iter()
+        .flat_map(|s| std::iter::repeat(s.kind == SegmentKind::En).take(s.raw.chars().count()))
+        .collect()
+}
+
+/// Whether a person could have meant this reading. Jev is easily swayed by
+/// options no one would type ("てstがとおらない", "issueをたてmasu"), so
+/// those are not offered.
+fn plausible(cand: &[Segment], extra_en: &HashSet<String>) -> bool {
+    let known = |w: &str| EN_WORDS.contains(w) || PROPER.contains_key(w) || extra_en.contains(w);
+    // Fine as romaji; a final n is ん still being typed ("hen").
+    let readable = |w: &str| {
+        let body = w.strip_suffix('n').filter(|b| !b.is_empty()).unwrap_or(w);
+        crate::romaji::scan(body).1.is_empty()
+    };
+    for (i, seg) in cand.iter().enumerate() {
+        let lower = seg.raw.to_ascii_lowercase();
+        let prev_en = i > 0 && cand[i - 1].kind == SegmentKind::En;
+        if i > 0 && splits_known_word(&cand[i - 1], seg, &known) {
+            return false;
+        }
+        match seg.kind {
+            SegmentKind::Ja => {
+                let last = i + 1 == cand.len();
+                let leftovers = if last {
+                    hard_leftovers(&lower)
+                } else {
+                    crate::romaji::scan(&lower).1
+                };
+                // "mm"/"rr" are not in the romaji table on purpose, but typed
+                // doubled they still mean っ ("purogurammingu").
+                let chars: Vec<char> = lower.chars().collect();
+                let doubled = |&p: &usize| chars.get(p + 1) == Some(&chars[p]);
+                if leftovers.iter().any(|p| !doubled(p)) {
+                    return false;
+                }
+                if prev_en {
+                    // "Than|k": a lone consonant after English belongs to the word.
+                    if lower.chars().all(|c| c.is_ascii_alphabetic() && !"aiueo".contains(c)) {
+                        return false;
+                    }
+                    // "kubernetesn|osettei": a syllable cut in half.
+                    let prev = cand[i - 1].raw.to_ascii_lowercase();
+                    let cut = lower.starts_with(|c: char| "aiueo".contains(c))
+                        && prev.ends_with(|c: char| c.is_ascii_alphabetic() && !"aiueo".contains(c));
+                    let last_word = cand[i - 1].surface.rsplit(' ').next().unwrap_or("").to_ascii_lowercase();
+                    if cut && !known(&last_word) {
+                        return false;
+                    }
+                }
+            }
+            SegmentKind::En => {
+                for word in seg.surface.split(' ').filter(|w| w.is_ascii()) {
+                    let w = word.to_ascii_lowercase();
+                    if !known(&w) && swallows_particle(word, &known) {
+                        return false;
+                    }
+                    // Lowercase and fine as romaji: unknown ("masu", "kuda") or a
+                    // short word that is also Japanese ("no", "are").
+                    if (!known(&w) || w.len() <= 3)
+                        && !word.starts_with(|c: char| c.is_ascii_uppercase())
+                        && readable(&w)
+                    {
+                        return false;
+                    }
+                }
+            }
+            SegmentKind::Other => {}
+        }
+    }
+    true
+}
+
+/// "terraformwoa|pply", "sampleco|de": the seam between English and Japanese
+/// runs through a known word.
+fn splits_known_word(left: &Segment, right: &Segment, known: &dyn Fn(&str) -> bool) -> bool {
+    if left.kind == right.kind || left.kind == SegmentKind::Other || right.kind == SegmentKind::Other {
+        return false;
+    }
+    let l: Vec<char> = left.raw.to_ascii_lowercase().chars().collect();
+    let r: Vec<char> = right.raw.to_ascii_lowercase().chars().collect();
+    (1..=l.len().min(12)).any(|a| {
+        (1..=r.len().min(12)).any(|b| {
+            if a + b < 4 {
+                return false;
+            }
+            let word: String = l[l.len() - a..].iter().chain(&r[..b]).collect();
+            known(&word)
+        })
+    })
+}
+
+/// "branchwo", "servergaochiteru", "AWSnoconsole": an English-looking start
+/// followed by a particle, all read as one unknown word. Jev tends to pick
+/// these, but English words almost never contain a particle at such a seam.
+fn swallows_particle(word: &str, known: &dyn Fn(&str) -> bool) -> bool {
+    const PARTICLES: &[&str] = &["no", "ni", "wo", "ga", "de", "to", "wa", "mo", "ha", "shi"];
+    let typed: Vec<char> = word.chars().collect();
+    let lower: Vec<char> = word.to_ascii_lowercase().chars().collect();
+    (2..lower.len()).any(|k| {
+        let rest: String = lower[k..].iter().collect();
+        if !PARTICLES.iter().any(|p| rest.starts_with(p)) {
+            return false;
+        }
+        // Part of a known word at the end ("sample|code"), not a particle.
+        let inside_known_tail = (0..=k).any(|j| {
+            let tail: String = lower[j..].iter().collect();
+            tail.len() >= 3 && known(&tail)
+        });
+        if inside_known_tail {
+            return false;
+        }
+        let head: String = lower[..k].iter().collect();
+        known(&head)
+            || !crate::romaji::scan(&head).1.is_empty()
+            || typed[..k].iter().all(|c| c.is_ascii_uppercase())
+    })
+}
+
 /// Plausible readings of the buffer for a judge (Jev) to choose from.
-/// The offline best is always first.
+/// The offline best is always first, the all-Japanese reading second.
 pub fn alternatives(raw: &str, limit: usize) -> Vec<Vec<Segment>> {
-    let best = segment(raw);
-    let mut out = vec![best.clone()];
-    let push = |cand: Vec<Segment>, out: &mut Vec<Vec<Segment>>| {
+    alternatives_with(raw, limit, &HashSet::new())
+}
+
+/// [`alternatives`] with extra known English words (learned from past commits).
+pub fn alternatives_with(raw: &str, limit: usize, extra_en: &HashSet<String>) -> Vec<Vec<Segment>> {
+    let best = segment_with(raw, extra_en);
+    let mut out: Vec<Vec<Segment>> = Vec::new();
+    let mut seen: HashSet<Vec<bool>> = HashSet::new();
+    let push = |cand: Vec<Segment>, out: &mut Vec<Vec<Segment>>, seen: &mut HashSet<Vec<bool>>| {
         let cand = merge_adjacent(cand);
-        if out.len() < limit && !out.contains(&cand) {
+        // The offline best is always offered, even when it looks odd.
+        if !out.is_empty() && !plausible(&cand, extra_en) {
+            return;
+        }
+        if out.len() < limit && seen.insert(english_mask(&cand)) {
             out.push(cand);
         }
     };
-
-    for i in 0..best.len() {
-        if let Some(flipped) = flip(&best[i]) {
-            let mut cand = best.clone();
-            cand[i] = flipped;
-            push(cand, &mut out);
-        }
-    }
+    push(best.clone(), &mut out, &mut seen);
 
     let all_ja: Vec<Segment> = best
         .iter()
@@ -524,7 +649,19 @@ pub fn alternatives(raw: &str, limit: usize) -> Vec<Vec<Segment>> {
             }
         })
         .collect();
-    push(all_ja, &mut out);
+    push(all_ja, &mut out, &mut seen);
+
+    for cand in crate::readings::readings(raw, extra_en, limit) {
+        push(cand, &mut out, &mut seen);
+    }
+
+    for i in 0..best.len() {
+        if let Some(flipped) = flip(&best[i]) {
+            let mut cand = best.clone();
+            cand[i] = flipped;
+            push(cand, &mut out, &mut seen);
+        }
+    }
 
     // Uppercase letters usually start an English word ("henshiwaThank").
     let mut cased = Vec::new();
@@ -564,8 +701,32 @@ pub fn alternatives(raw: &str, limit: usize) -> Vec<Vec<Segment>> {
         }
     }
     flush(&mut buf, &mut cased);
-    push(cased, &mut out);
+    push(cased, &mut out, &mut seen);
 
+    out
+}
+
+/// English words worth remembering from a commit: shown in `committed`, not in
+/// the built-in lexicon, and not readable as romaji ("make" could be まけ, so
+/// learning it would turn Japanese into English later).
+pub fn words_to_learn(committed: &str, segments: &[Segment]) -> Vec<String> {
+    let mut out = Vec::new();
+    for s in segments.iter().filter(|s| s.kind == SegmentKind::En) {
+        for word in s.surface.split(' ') {
+            let lower = word.to_ascii_lowercase();
+            if lower.len() < 2
+                || !lower.chars().all(|c| c.is_ascii_lowercase())
+                || !committed.contains(word)
+                || EN_WORDS.contains(lower.as_str())
+                || PROPER.contains_key(lower.as_str())
+                || crate::romaji::scan(&lower).1.is_empty()
+                || out.contains(&lower)
+            {
+                continue;
+            }
+            out.push(lower);
+        }
+    }
     out
 }
 
@@ -678,12 +839,52 @@ mod tests {
     fn alternatives_offer_flips() {
         let alts = alternatives("henshiwaThank", 8);
         assert_eq!(alts[0], segment("henshiwaThank"));
-        assert!(alts
+        assert!(alts.len() <= 8);
+        // Japanese stays on offer when it reads as Japanese…
+        assert!(alternatives("datatte", 8)
             .iter()
             .any(|a| a.iter().all(|s| s.kind == SegmentKind::Ja)));
-        assert!(alts.len() <= 8);
+        // …but not as garbled kana ("てぁnk").
+        assert!(!alts
+            .iter()
+            .any(|a| a.iter().all(|s| s.kind == SegmentKind::Ja)));
         let unique: HashSet<String> = alts.iter().map(|a| format!("{a:?}")).collect();
         assert_eq!(unique.len(), alts.len());
+    }
+
+    #[test]
+    fn particles_glued_to_english_are_not_offered() {
+        let known = |w: &str| EN_WORDS.contains(w);
+        for w in ["branchwo", "serverga", "bugwo", "AWSnoconsole", "Figmanodezain"] {
+            assert!(swallows_particle(w, &known), "{w}");
+        }
+        for w in ["Gemini", "Notion", "kubernetes", "production", "samplecode"] {
+            assert!(!swallows_particle(w, &known), "{w}");
+        }
+    }
+
+    #[test]
+    fn junk_readings_are_not_offered() {
+        let none = HashSet::new();
+        let en = |raw: &str, surface: &str| Segment { kind: SegmentKind::En, raw: raw.into(), surface: surface.into() };
+        let ja = |raw: &str| Segment { kind: SegmentKind::Ja, raw: raw.into(), surface: to_ime_kana(raw, false) };
+        assert!(!plausible(&[en("Meetno", "Meet no")], &none));
+        assert!(!plausible(&[en("hen", "hen"), ja("shiwa")], &none));
+        assert!(!plausible(&[en("terraform", "terraform"), ja("woa"), en("pply", "pply"), ja("shita")], &none));
+        assert!(!plausible(&[en("closeshimasu", "closeshimasu")], &none));
+        assert!(plausible(&[en("terraform", "terraform"), ja("wo"), en("apply", "apply"), ja("shita")], &none));
+        assert!(plausible(&[en("data", "data"), ja("tte")], &none));
+    }
+
+    #[test]
+    fn learns_only_unreadable_words_that_were_committed() {
+        let segments = vec![
+            Segment { kind: SegmentKind::En, raw: "Figma".into(), surface: "Figma".into() },
+            Segment { kind: SegmentKind::Ja, raw: "no".into(), surface: "の".into() },
+            Segment { kind: SegmentKind::En, raw: "makegit".into(), surface: "make git".into() },
+        ];
+        assert_eq!(words_to_learn("Figmaのmake git", &segments), vec!["figma"]);
+        assert!(words_to_learn("ふぃgmaの", &segments).is_empty());
     }
 
     #[test]

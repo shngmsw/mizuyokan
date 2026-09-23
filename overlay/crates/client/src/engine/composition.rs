@@ -356,6 +356,9 @@ impl TextServiceFactory {
         let mut transition = transition;
         let mut new_mode: Option<InputMode> = None;
         let mut mixed = composition.mixed.clone();
+        // Escape and the last Backspace end the composition through RemoveText:
+        // that is a cancel, not a commit, so nothing is learned from it.
+        let mut cancelled = false;
 
         self.update_context(&preview)?;
 
@@ -367,6 +370,9 @@ impl TextServiceFactory {
                     ipc_service.show_window()?;
                 }
                 ClientAction::EndComposition => {
+                    if !cancelled {
+                        super::mizuyokan::learn(&format!("{preview}{suffix}"), mixed.as_deref());
+                    }
                     self.end_composition()?;
                     selection_index = 0;
                     corresponding_count = 0;
@@ -417,6 +423,7 @@ impl TextServiceFactory {
                     ipc_service.set_selection(selection_index as i32)?;
                 }
                 ClientAction::RemoveText => {
+                    cancelled = true;
                     candidates = ipc_service.remove_text()?;
                     corresponding_count = candidates
                         .corresponding_count
@@ -566,6 +573,8 @@ impl TextServiceFactory {
                     self.set_text(&text, &sub_text)?;
                 }
                 ClientAction::ShrinkText(text) => {
+                    // `preview` is the part being committed.
+                    super::mizuyokan::learn(&preview, mixed.as_deref());
                     // shrink text
                     raw_input.push_str(&text);
                     raw_input = raw_input

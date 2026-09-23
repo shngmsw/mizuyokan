@@ -13,7 +13,9 @@ use std::{
 };
 
 use anyhow::Result;
-use mizuyokan_engine::{jev_judge, segment, JevConfig, Judgement, Prefetcher, Segment, SegmentKind};
+use mizuyokan_engine::{
+    jev_judge, words_to_learn, JevConfig, Judgement, Prefetcher, Segment, SegmentKind,
+};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -22,6 +24,9 @@ use super::{
 };
 
 const SETTINGS_FILENAME: &str = "mizuyokan.json";
+/// English words learned from commits, one per line. Shared by every app
+/// that loads the IME; each process appends what it learns.
+const WORDS_FILENAME: &str = "mizuyokan_words.txt";
 /// Defaults match karukan's idea of adaptive degrade: a few bad calls and we
 /// stop waiting on the enhancement layer so typing stays on plain azooKey.
 const JEV_FAIL_THRESHOLD_DEFAULT: u32 = 3;
@@ -44,6 +49,9 @@ pub struct Settings {
     pub jev_cooldown_ms: u64,
     /// Append decisions to mizuyokan.log. Off by default: the log contains typed text.
     pub debug_log: bool,
+    /// Remember committed English words (mizuyokan_words.txt) so they are
+    /// recognised offline next time.
+    pub learn_words: bool,
 }
 
 impl Default for Settings {
@@ -57,6 +65,7 @@ impl Default for Settings {
             jev_fail_threshold: JEV_FAIL_THRESHOLD_DEFAULT,
             jev_cooldown_ms: JEV_COOLDOWN_DEFAULT.as_millis() as u64,
             debug_log: false,
+            learn_words: true,
         }
     }
 }
@@ -91,6 +100,7 @@ struct Loaded {
     fail_threshold: u32,
     cooldown: Duration,
     debug_log: bool,
+    learn_words: bool,
 }
 
 impl Default for Loaded {
@@ -100,6 +110,7 @@ impl Default for Loaded {
             fail_threshold: JEV_FAIL_THRESHOLD_DEFAULT,
             cooldown: JEV_COOLDOWN_DEFAULT,
             debug_log: false,
+            learn_words: true,
         }
     }
 }
@@ -133,6 +144,7 @@ fn loaded() -> Loaded {
         fail_threshold: settings.jev_fail_threshold.max(1),
         cooldown: Duration::from_millis(settings.jev_cooldown_ms.max(1)),
         debug_log: settings.debug_log,
+        learn_words: settings.learn_words,
     };
     *cache = Some((modified, loaded.clone()));
     drop(cache);
@@ -285,10 +297,64 @@ mod dpapi {
 }
 
 
+fn words_path() -> Option<PathBuf> {
+    Settings::path().map(|p| p.with_file_name(WORDS_FILENAME))
+}
+
+/// Pull in words other processes learned since the last look (by mtime).
+fn load_learned() {
+    static SEEN: LazyLock<Mutex<Option<SystemTime>>> = LazyLock::new(|| Mutex::new(None));
+    let Some(path) = words_path() else {
+        return;
+    };
+    let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+        return;
+    };
+    let Ok(mut seen) = SEEN.lock() else {
+        return;
+    };
+    if *seen == Some(modified) {
+        return;
+    }
+    *seen = Some(modified);
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        Prefetcher::global().remember(
+            text.lines()
+                .map(|l| l.trim().to_ascii_lowercase())
+                .filter(|w| !w.is_empty()),
+        );
+    }
+}
+
+/// Remember the English words of a commit. `segments` is the segmentation
+/// azooKey was fed (`None` = plain azooKey: nothing to learn).
+pub fn learn(committed: &str, segments: Option<&[Segment]>) {
+    let Some(segments) = segments else {
+        return;
+    };
+    if committed.is_empty() || !loaded().learn_words {
+        return;
+    }
+    load_learned();
+    let new = Prefetcher::global().remember(words_to_learn(committed, segments));
+    if new.is_empty() {
+        return;
+    }
+    debug_log!("learned {new:?}");
+    use std::io::Write as _;
+    if let Some(mut file) = words_path().and_then(|p| {
+        std::fs::OpenOptions::new().create(true).append(true).open(p).ok()
+    }) {
+        let _ = file.write_all(format!("{}
+", new.join("
+")).as_bytes());
+    }
+}
+
 /// Jev is only worth waiting for when the buffer may contain English.
 pub fn looks_mixed(raw: &str) -> bool {
     raw.chars().any(|c| c.is_ascii_uppercase())
-        || segment(raw).iter().any(|s| s.kind == SegmentKind::En)
+        || Prefetcher::global().segment(raw).iter().any(|s| s.kind == SegmentKind::En)
 }
 
 /// Called after every keystroke in Kana mode: start judging in the background.
@@ -300,6 +366,7 @@ pub fn prefetch(raw: &str) {
     }
     match jev_ready() {
         Some(config) => {
+            load_learned();
             debug_log!("prefetch {raw:?}");
             Prefetcher::global().request(raw, monitored_judge(config));
         }
@@ -362,7 +429,8 @@ pub fn display(mut candidates: Candidates, segments: &[Segment]) -> Candidates {
 }
 
 /// Segmentation to feed azooKey, or `None` for a plain azooKey feed.
-/// While typing (`settle == false`) only finished judgements are used; on Space /
+/// While typing (`settle == false`) finished judgements are used, with the
+/// offline guess filling in until Jev answers (see `Prefetcher::live`); on Space /
 /// Enter the judgement of the whole buffer is awaited when it may hold English.
 /// Any Jev API / timeout failure returns `None` so the IME stays on plain azooKey.
 fn target_segments(raw: &str, settle: bool) -> Option<Vec<Segment>> {
@@ -389,7 +457,7 @@ fn target_segments(raw: &str, settle: bool) -> Option<Vec<Segment>> {
             _ => None,
         };
     }
-    prefetcher.confirmed(raw)
+    prefetcher.live(raw)
 }
 
 fn feed_azookey(
@@ -463,7 +531,7 @@ fn restore_plain(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mizuyokan_engine::render_offline;
+    use mizuyokan_engine::{render_offline, segment};
 
     fn candidates(texts: &[&str], subs: &[&str]) -> Candidates {
         Candidates {
@@ -575,6 +643,7 @@ mod tests {
         assert_eq!(parsed.jev_fail_threshold, 3);
         assert_eq!(parsed.jev_cooldown_ms, 60_000);
         assert_eq!(parsed.jev_model, "typesafe/jev-latest");
+        assert!(parsed.learn_words);
         assert_eq!(Settings::parse("{ not json"), Settings::default());
         assert!(Settings::default().jev_config().is_none());
         let disabled = Settings { enable: false, jev_api_key_dpapi: "x".into(), ..Default::default() };

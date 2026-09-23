@@ -40,9 +40,11 @@ Jev を使う場合は API キーを登録します（後述）。登録しな�
 
 1. ひらがなモードで打つたび、ローマ字の入力バッファから「英語／日本語の区切り方」の候補を端末内で作ります（英単語リストと、ローマ字として読めない箇所の推定）。
 2. API キーがある場合、裏で Jev に「どの候補が意図した文か」を尋ねます（目安 0.3〜0.5 秒）。打鍵のたびに先読みするので、Space を押すころには答えが揃っていることが多いです。
-3. 英語と判断した部分は、azooKey には全角の英字として渡します。azooKey は全角英字をかな漢字にしないため英語が残り、画面には元の半角綴りで見せます。日本語部分だけがかな漢字変換されます。
-4. Space や Enter のときは、英語が混ざっていそうな入力に限って判定の完了を待ってから候補表示・確定します。日本語だけのときは待ちません。
-5. Jev への問い合わせが何度も失敗すると、しばらく Jev を使わず azooKey だけに切り替えます。
+3. Jev の答えが届くまでは、端末内の区切りで英語らしい部分を仮に表示します。Jev の答えが届いたらそちらに合わせます。
+4. 英語と判断した部分は、azooKey には全角の英字として渡します。azooKey は全角英字をかな漢字にしないため英語が残り、画面には元の半角綴りで見せます。日本語部分だけがかな漢字変換されます。
+5. Space や Enter のときは、英語が混ざっていそうな入力に限って判定の完了を待ってから候補表示・確定します。日本語だけのときは待ちません。
+6. Jev への問い合わせが何度も失敗すると、しばらく Jev を使わず azooKey だけに切り替えます。
+7. 確定した文に含まれる英単語のうち、ローマ字として読めない語（`figma`、`docker` など）を覚えます。次からは Jev を待たずに英語として扱います。`make` のようにローマ字としても読める語は、日本語を誤って英語にしないよう覚えません。
 
 ## 構成
 
@@ -70,6 +72,14 @@ cd azookey-windows-mizuyokan
 $env:PROTOC = "<protoc.exe のパス>"    # PATH に入っていれば不要
 cargo test -p azookey-windows
 cargo test -p azookey-windows live_ -- --ignored --nocapture   # 起動中の azooKey と実 Jev で確認
+```
+
+区切りの精度は `engine/tests/eval_cases.txt`（英語の部分を `[ ]` で囲んだ入力例）で測ります。
+
+```powershell
+cd engine
+cargo test --test eval -- --nocapture                               # 端末内の区切り／Jev に渡す選択肢に正解が入っている割合
+$env:JEV_API_KEY = "<key>"; cargo test --test eval jev -- --ignored --nocapture   # 実 Jev の正解率と待ち時間（件数分 API を呼びます）
 ```
 
 `bootstrap-fork.ps1` を再実行すると、upstream を pin に戻してからオーバーレイを当て直します。フォーク側で直接いじった変更は消えるので、編集は `overlay/` に入れてください。
@@ -102,13 +112,15 @@ cargo test -p azookey-windows live_ -- --ignored --nocapture   # 起動中の az
   "jev_timeout_ms": 1500,
   "jev_fail_threshold": 3,
   "jev_cooldown_ms": 60000,
-  "debug_log": false
+  "debug_log": false,
+  "learn_words": true
 }
 ```
 
 - API キーは DPAPI（その Windows ユーザー向け）で暗号化して保存します。平文では保存しません。
 - `enable: false`、キー未設定、または API エラーが続くときは、通常の azooKey だけが動きます。
 - `jev_fail_threshold` / `jev_cooldown_ms` で、連続失敗後に Jev を休止する条件を変えられます（既定: 3回 / 60秒）。
+- `learn_words: false` にすると英単語の学習を止めます。覚えた語は `%APPDATA%\Azookey\mizuyokan_words.txt` に1行1語で残ります。消したい語はこのファイルから行を削除してください。
 - `debug_log: true` にすると `%APPDATA%\Azookey\mizuyokan.log` に判定の経過を書きます。**打った文字列が残る**ので、調査のときだけ使ってください。
 - Jev 利用時は、英日判定のために入力ローマ字がゲートウェイ（既定はロリポップ！AIゲートウェイ）へ送られます。キーが無いときは送りません。
 
