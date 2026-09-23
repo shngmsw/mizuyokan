@@ -1,0 +1,21 @@
+# Logs
+logs
+*.log
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.sln
+*.sw?
+
+# Build outputs
+target/
+engine/Cargo.lock
+
+# Local / agent artifacts
+agent-tools
+/tmp
+/azookey-windows-mizuyokan
