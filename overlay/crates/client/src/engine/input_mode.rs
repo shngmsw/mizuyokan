@@ -35,6 +35,17 @@ impl InputMode {
     pub fn is_open(&self) -> bool {
         *self == InputMode::Kana
     }
+
+    /// Mode for the dedicated IME on/off keys. AutoHotkey sends these instead of
+    /// flipping the open/close compartment, whose change is not delivered to us
+    /// in Chromium-based apps.
+    pub fn for_ime_key(vk: usize) -> Option<Self> {
+        match vk {
+            0x16 => Some(InputMode::Kana),  // VK_IME_ON
+            0x1A => Some(InputMode::Latin), // VK_IME_OFF
+            _ => None,
+        }
+    }
 }
 
 impl TextServiceFactory {
@@ -66,5 +77,14 @@ mod tests {
             assert_eq!(InputMode::for_open_state(mode.is_open()), mode);
             assert_eq!(mode.toggle().toggle(), mode);
         }
+    }
+
+    #[test]
+    fn ime_keys_pick_a_mode() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{VK_IME_OFF, VK_IME_ON};
+        assert_eq!(InputMode::for_ime_key(VK_IME_ON.0 as usize), Some(InputMode::Kana));
+        assert_eq!(InputMode::for_ime_key(VK_IME_OFF.0 as usize), Some(InputMode::Latin));
+        assert_eq!(InputMode::for_ime_key(0xF3), None);
+        assert_eq!(InputMode::for_ime_key(0x41), None);
     }
 }

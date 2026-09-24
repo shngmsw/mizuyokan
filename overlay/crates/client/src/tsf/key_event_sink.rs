@@ -13,7 +13,8 @@ use anyhow::Result;
 
 use super::factory::TextServiceFactory_Impl;
 use crate::engine::{
-    client_action::ClientAction, composition::CompositionState, state::IMEState,
+    client_action::ClientAction, composition::CompositionState, input_mode::InputMode,
+    state::IMEState,
 };
 
 pub const GUID_PRESERVEDKEY_TOGGLE: GUID =
@@ -38,6 +39,9 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
     ) -> Result<BOOL> {
         // this function checks if the key event will be handled by "OnKeyUp" function
         // so we need to return TRUE if we want to handle the key event
+        if pic.is_some() && InputMode::for_ime_key(wparam.0).is_some() {
+            return Ok(true.into());
+        }
         let result = self.process_key(pic, wparam)?.is_some();
 
         Ok(result.into())
@@ -48,6 +52,12 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
     fn OnKeyDown(&self, pic: Option<&ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
         // this function is called when a key is pressed
         // we can handle key events here
+        if let (Some(context), Some(target)) = (pic, InputMode::for_ime_key(wparam.0)) {
+            // VK_IME_ON / VK_IME_OFF: eaten even when the mode already matches
+            self.borrow_mut()?.context = Some(context.clone());
+            self.switch_input_mode(target)?;
+            return Ok(true.into());
+        }
         let result = self.handle_key(pic, wparam)?;
 
         Ok(result.into())
