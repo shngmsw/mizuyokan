@@ -55,13 +55,13 @@ Pipeline per keystroke in Kana mode (`overlay/.../engine/composition.rs` calls i
    While typing, `Prefetcher::live()` shows the Jev-judged prefix, or the offline guess where Jev has not answered yet (a Japanese-only judgement of a prefix wins over it).
 5. **Settle** (Space/Enter): if `looks_mixed(raw)`, wait for the prefetched judgement (up to `jev_timeout_ms`) or judge synchronously; Japanese-only input never waits.
 
-**Learning:** on commit (`EndComposition` not preceded by `RemoveText`, and `ShrinkText`), `mizuyokan::learn` stores English words from `Composition.mixed` that are not readable as romaji into `%APPDATA%\Azookey\mizuyokan_words.txt`; they feed `extra_en` via `Prefetcher::remember`.
+**Learning:** on commit (`EndComposition` not preceded by `RemoveText`, and `ShrinkText`), `mizuyokan::learn` takes English words from `Composition.mixed` that pass `convert::worth_learning` (not romaji, not romaji still being typed like `att` of `atta`, English-like spelling; vowel-less acronyms such as `ssh`/`pc` up to 5 letters pass). Each commit is counted in `mizuyokan_word_candidates.txt` (one line per commit); after `LEARN_AFTER_COMMITS` (2) the word is due and Jev is asked once, on a background thread (`Prefetcher::vet_in_background`, `JevClient::real_word_probability`), whether it is a real English word / established tech term. At or above `learn_word_threshold` (mizuyokan.json, default 0.8) it goes to `%APPDATA%\Azookey\mizuyokan_words.txt` and feeds `extra_en` via `Prefetcher::remember`; below it, to `mizuyokan_words_rejected.txt` (never counted or asked again). No usable Jev (no key, disabled, error, timeout, circuit open) means not learned and nothing recorded: `Prefetcher::postpone` makes the word due again on its next commit. Words already in `mizuyokan_words.txt` are loaded as-is (the rules only gate new learning).
 
 **Fallback invariant:** any Jev problem (no key, `enable: false`, API error, timeout, IPC error on the mixed feed) must degrade to plain azooKey, never an `Err` that breaks typing. Consecutive failures trip a circuit breaker (`jev_fail_threshold` / `jev_cooldown_ms`).
 
 Settings live in `%APPDATA%\Azookey\mizuyokan.json`, deliberately separate from azooKey's `settings.json` (the launcher rewrites that file and drops unknown keys). The API key is stored DPAPI-encrypted (`jev_api_key_dpapi`) and decrypted in `mizuyokan.rs`. `debug_log: true` writes typed text to `mizuyokan.log` — debug only.
 
-Input modes are just azooKey's two (`A` / `あ`); toggling via 半角/全角, ``Alt+` ``, IME open/close compartment (`compartment_sink.rs`), or the taskbar icon.
+Input modes are just azooKey's two (`A` / `あ`); toggling via 半角/全角, ``Alt+` ``, IME open/close compartment (`compartment_sink.rs`), `VK_IME_ON`/`VK_IME_OFF` keys (`key_event_sink.rs`; the compartment change does not reach us in Chromium apps), or the taskbar icon.
 
 ## Distribution constraints
 

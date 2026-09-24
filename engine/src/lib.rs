@@ -15,8 +15,11 @@ mod romaji;
 
 pub use convert::{
     alternatives, alternatives_with, english_mask, live_convert, render_offline, segment,
-    segment_with, take_committed, words_to_learn, ConvertResult, Segment, SegmentKind,
+    segment_with, take_committed, words_to_learn, worth_learning, ConvertResult, Segment, SegmentKind,
 };
 pub use jev::{JevClient, JevConfig, JevError};
-pub use prefetch::{jev_judge, judge_segments, judge_segments_with, Judge, Judgement, Prefetcher};
+pub use prefetch::{
+    jev_judge, jev_word_check, judge_segments, judge_segments_with, Judge, Judgement, Prefetcher,
+    Vetted, WordCheck, LEARN_AFTER_COMMITS, LEARN_THRESHOLD_DEFAULT,
+};
 pub use romaji::is_commit_punct;

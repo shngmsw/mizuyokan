@@ -12,13 +12,21 @@ use std::{
 };
 
 use crate::{
-    convert::{alternatives_with, as_japanese, concat, render_offline, segment_with, Segment, SegmentKind},
+    convert::{
+        alternatives_with, as_japanese, concat, cuts_syllable, render_offline, segment_with, Segment,
+        SegmentKind,
+    },
+    dict::{EN_WORDS, PROPER},
     jev::{JevClient, JevConfig},
 };
 
 const MAX_ALTERNATIVES: usize = 8;
 const MAX_ENTRIES: usize = 64;
 const MAX_LEARNED: usize = 5000;
+/// Commits a word needs before it is learned: a typo is rarely repeated.
+pub const LEARN_AFTER_COMMITS: usize = 2;
+/// Default minimum probability (from Jev) that a word is real before it is learned.
+pub const LEARN_THRESHOLD_DEFAULT: f64 = 0.8;
 
 /// Outcome of judging one raw buffer.
 #[derive(Debug, Clone, PartialEq)]
@@ -65,6 +73,31 @@ pub struct Prefetcher {
     ready: Condvar,
     /// English words confirmed by past commits; treated like the built-in lexicon.
     learned: RwLock<HashSet<String>>,
+    /// Candidates committed fewer than [`LEARN_AFTER_COMMITS`] times.
+    sightings: Mutex<HashMap<String, usize>>,
+    /// Words Jev judged not to be real; never counted or asked about again.
+    rejected: RwLock<HashSet<String>>,
+    /// Words due for learning whose check is running (or about to run).
+    vetting: Mutex<HashSet<String>>,
+}
+
+/// Probability that a word is a real English word / technical term, or
+/// `None` when it could not be judged (no key, API error, timeout, circuit open).
+pub type WordCheck = dyn Fn(&str) -> Option<f64> + Send + Sync;
+
+pub fn jev_word_check(config: JevConfig) -> Arc<WordCheck> {
+    Arc::new(move |word: &str| JevClient::new(config.clone()).real_word_probability(word).ok())
+}
+
+/// Result of [`Prefetcher::vet`].
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Vetted {
+    /// Judged real and newly learned; record them as learned.
+    pub learned: Vec<String>,
+    /// Judged not real; record them so they are never asked about again.
+    pub rejected: Vec<String>,
+    /// Could not be judged; not learned, and checked again on a later commit.
+    pub retry: Vec<String>,
 }
 
 /// Picks one of `options` (rendered texts); `None` when no decision could be made.
@@ -106,6 +139,94 @@ impl Prefetcher {
             state: Mutex::new(State::default()),
             ready: Condvar::new(),
             learned: RwLock::new(HashSet::new()),
+            sightings: Mutex::new(HashMap::new()),
+            rejected: RwLock::new(HashSet::new()),
+            vetting: Mutex::new(HashSet::new()),
+        }
+    }
+
+    pub fn rejected(&self) -> HashSet<String> {
+        self.rejected.read().map(|r| r.clone()).unwrap_or_default()
+    }
+
+    /// Add words judged not real (e.g. recorded by another process).
+    pub fn note_rejected(&self, words: impl IntoIterator<Item = String>) {
+        let Ok(mut rejected) = self.rejected.write() else {
+            return;
+        };
+        for word in words {
+            if rejected.len() >= MAX_LEARNED {
+                break;
+            }
+            rejected.insert(word);
+        }
+    }
+
+    /// `words` without the ones already learned, rejected or being checked.
+    pub fn undecided(&self, words: impl IntoIterator<Item = String>) -> Vec<String> {
+        let learned = self.learned();
+        let rejected = self.rejected();
+        let vetting = self.vetting.lock().map(|v| v.clone()).unwrap_or_default();
+        words
+            .into_iter()
+            .filter(|w| !learned.contains(w) && !rejected.contains(w) && !vetting.contains(w))
+            .collect()
+    }
+
+    /// Ask `check` about each word that [`Self::sight`] made due, one call per
+    /// word, and learn those whose probability is at least `threshold`.
+    /// Words that could not be judged are put back one commit short of due.
+    pub fn vet(&self, words: Vec<String>, check: &WordCheck, threshold: f64) -> Vetted {
+        let threshold = if threshold.is_nan() { 1.0 } else { threshold.clamp(0.0, 1.0) };
+        let mut out = Vetted::default();
+        let mut accepted = Vec::new();
+        for word in words {
+            match check(&word) {
+                Some(p) if p >= threshold => accepted.push(word),
+                Some(_) => out.rejected.push(word),
+                None => out.retry.push(word),
+            }
+        }
+        out.learned = self.remember(accepted);
+        self.note_rejected(out.rejected.clone());
+        self.postpone(out.retry.clone());
+        if let Ok(mut vetting) = self.vetting.lock() {
+            for word in out.learned.iter().chain(&out.rejected) {
+                vetting.remove(word);
+            }
+        }
+        out
+    }
+
+    /// [`Self::vet`] on a background thread (a Jev call must never hold up
+    /// typing); `done` gets the result there, e.g. to record it in files.
+    pub fn vet_in_background(
+        &'static self,
+        words: Vec<String>,
+        check: Arc<WordCheck>,
+        threshold: f64,
+        done: impl FnOnce(Vetted) + Send + 'static,
+    ) {
+        if words.is_empty() {
+            return;
+        }
+        std::thread::spawn(move || done(self.vet(words, check.as_ref(), threshold)));
+    }
+
+    /// Words due for learning that cannot be checked now (no usable Jev): not
+    /// learned, and due again on their next commit.
+    pub fn postpone(&self, words: impl IntoIterator<Item = String>) {
+        let words: Vec<String> = words.into_iter().collect();
+        if let Ok(mut vetting) = self.vetting.lock() {
+            for word in &words {
+                vetting.remove(word);
+            }
+        }
+        if let Ok(mut sightings) = self.sightings.lock() {
+            for word in words {
+                let count = sightings.entry(word).or_insert(0);
+                *count = (*count).max(LEARN_AFTER_COMMITS - 1);
+            }
         }
     }
 
@@ -118,10 +239,64 @@ impl Prefetcher {
         let Ok(mut learned) = self.learned.write() else {
             return Vec::new();
         };
-        words
+        let new: Vec<String> = words
             .into_iter()
             .filter(|w| learned.len() < MAX_LEARNED && learned.insert(w.clone()))
-            .collect()
+            .collect();
+        drop(learned);
+        if let Ok(mut vetting) = self.vetting.lock() {
+            for word in &new {
+                vetting.remove(word);
+            }
+        }
+        new
+    }
+
+    /// Count one commit of each candidate word (from `words_to_learn`) and
+    /// return those that have now been committed [`LEARN_AFTER_COMMITS`]
+    /// times; pass them to [`Self::vet`] (or [`Self::postpone`] when they
+    /// cannot be checked). Learned, rejected and in-check words are ignored.
+    pub fn sight(&self, words: impl IntoIterator<Item = String>) -> Vec<String> {
+        let words = self.undecided(words);
+        let Ok(mut sightings) = self.sightings.lock() else {
+            return Vec::new();
+        };
+        let mut due = Vec::new();
+        for word in words {
+            if due.contains(&word) {
+                continue;
+            }
+            let count = sightings.entry(word.clone()).or_insert(0);
+            *count += 1;
+            if *count >= LEARN_AFTER_COMMITS {
+                sightings.remove(&word);
+                due.push(word);
+            }
+        }
+        if sightings.len() > MAX_LEARNED {
+            sightings.clear();
+        }
+        drop(sightings);
+        if let Ok(mut vetting) = self.vetting.lock() {
+            vetting.extend(due.iter().cloned());
+        }
+        due
+    }
+
+    /// Merge commit counts recorded elsewhere (another process); keeps the larger count.
+    pub fn note_sightings(&self, counts: impl IntoIterator<Item = (String, usize)>) {
+        let learned = self.learned();
+        let rejected = self.rejected();
+        let Ok(mut sightings) = self.sightings.lock() else {
+            return;
+        };
+        for (word, count) in counts {
+            if learned.contains(&word) || rejected.contains(&word) || sightings.len() >= MAX_LEARNED {
+                continue;
+            }
+            let seen = sightings.entry(word).or_insert(0);
+            *seen = (*seen).max(count);
+        }
     }
 
     /// Offline segmentation that also knows the learned words.
@@ -188,10 +363,43 @@ impl Prefetcher {
             .skip(1)
             .chain(std::iter::once(raw.len()))
             .collect();
-        boundaries.iter().rev().find_map(|&end| match state.done.get(&raw[..end]) {
+        let (end, segments) = boundaries.iter().rev().find_map(|&end| match state.done.get(&raw[..end]) {
             Some(Judgement::Chosen(segments)) => Some((end, segments.clone())),
             _ => None,
-        })
+        })?;
+        drop(state);
+        if self.outgrown(&segments, &raw[end..]) {
+            return None;
+        }
+        Some((end, segments))
+    }
+
+    /// Whether the letters typed after a judged prefix take its final English
+    /// word's closing consonant into a kana syllable ("att" judged English,
+    /// then "a": あった). The old judgement no longer describes the buffer.
+    /// Known words longer than three letters and capitalized words keep it
+    /// ("review|onegai", "Notion|ni").
+    fn outgrown(&self, segments: &[Segment], rest: &str) -> bool {
+        let Some(last) = segments.last().filter(|s| s.kind == SegmentKind::En) else {
+            return false;
+        };
+        if !rest.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            return false;
+        }
+        let Some(word) = last.surface.rsplit(' ').next() else {
+            return false;
+        };
+        if word.starts_with(|c: char| c.is_ascii_uppercase()) {
+            return false;
+        }
+        let lower = word.to_ascii_lowercase();
+        let known = EN_WORDS.contains(lower.as_str())
+            || PROPER.contains_key(lower.as_str())
+            || self.learned().contains(&lower);
+        if known && lower.len() > 3 {
+            return false;
+        }
+        cuts_syllable(&last.raw, rest, true)
     }
 
     /// Segmentation to show while typing, without waiting: the longest prefix of
@@ -357,6 +565,35 @@ mod tests {
         assert_eq!(p.live("gitpullshitara"), p.confirmed("gitpullshitara"));
     }
 
+    /// As if Jev had picked English for all of `raw`.
+    fn judged_english(p: &Prefetcher, raw: &str) {
+        let segments = vec![Segment { kind: SegmentKind::En, raw: raw.into(), surface: raw.into() }];
+        p.state.lock().unwrap().store_chosen(raw.to_string(), segments);
+    }
+
+    #[test]
+    fn outgrown_english_prefix_is_dropped() {
+        let p = leak();
+        // "att" judged English, then "a": not "attあ" but plain azooKey (あった).
+        judged_english(p, "att");
+        assert_eq!(p.confirmed("atta"), None);
+        assert_eq!(p.live("atta"), None);
+        assert!(p.live("att").is_some(), "the judgement itself still applies");
+        judged_english(p, "kit");
+        assert_eq!(p.live("kitt"), None);
+        assert_eq!(p.live("kitte"), None);
+        judged_english(p, "mot");
+        assert_eq!(p.live("motto"), None);
+        // English that the next letters do not continue is kept.
+        judged_english(p, "git");
+        assert_eq!(render_offline(&p.live("gitpull").unwrap())[..3], *"git");
+        // Known words and capitalized words keep their judgement ("review|o…").
+        judged_english(p, "review");
+        assert!(p.confirmed("reviewonegai").is_some());
+        judged_english(p, "Att");
+        assert!(p.confirmed("Atta").is_some());
+    }
+
     #[test]
     fn suffix_is_never_guessed_as_english() {
         let p = leak();
@@ -367,6 +604,131 @@ mod tests {
 
     fn prefer_english_acronym() -> Arc<Judge> {
         Arc::new(|_: &str, options: &[String]| options.iter().position(|o| o.starts_with("PR")))
+    }
+
+    #[test]
+    fn words_are_learned_on_the_second_commit() {
+        let p = leak();
+        let w = |s: &str| vec![s.to_string()];
+        assert!(p.sight(w("figma")).is_empty());
+        assert_eq!(p.sight(w("figma")), w("figma"));
+        assert_eq!(p.remember(w("figma")), w("figma"));
+        assert!(p.sight(w("figma")).is_empty(), "already learned");
+        // A count from another process's file counts too.
+        p.note_sightings([("docker".to_string(), 1)]);
+        assert_eq!(p.sight(w("docker")), w("docker"));
+    }
+
+    /// A stub Jev word check that answers `p` and records what it was asked.
+    fn stub_check(p: Option<f64>) -> (Arc<WordCheck>, Arc<Mutex<Vec<String>>>) {
+        let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+        let record = asked.clone();
+        let check: Arc<WordCheck> = Arc::new(move |word: &str| {
+            record.lock().unwrap().push(word.to_string());
+            p
+        });
+        (check, asked)
+    }
+
+    fn commit_twice(p: &Prefetcher, word: &str) -> Vec<String> {
+        assert!(p.sight([word.to_string()]).is_empty());
+        p.sight([word.to_string()])
+    }
+
+    #[test]
+    fn real_word_is_learned_after_one_check() {
+        let p = leak();
+        let (check, asked) = stub_check(Some(0.95));
+        let due = commit_twice(p, "kubectl");
+        assert_eq!(due, vec!["kubectl".to_string()]);
+        let vetted = p.vet(due, check.as_ref(), LEARN_THRESHOLD_DEFAULT);
+        assert_eq!(vetted.learned, vec!["kubectl".to_string()]);
+        assert!(vetted.rejected.is_empty() && vetted.retry.is_empty());
+        assert!(p.learned().contains("kubectl"));
+        // Later commits neither count nor ask again.
+        assert!(p.sight(["kubectl".to_string()]).is_empty());
+        assert!(p.sight(["kubectl".to_string()]).is_empty());
+        assert_eq!(asked.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unreal_word_is_rejected_for_good() {
+        let p = leak();
+        let (check, asked) = stub_check(Some(0.3));
+        let due = commit_twice(p, "okik");
+        let vetted = p.vet(due, check.as_ref(), LEARN_THRESHOLD_DEFAULT);
+        assert!(vetted.learned.is_empty());
+        assert_eq!(vetted.rejected, vec!["okik".to_string()]);
+        assert!(!p.learned().contains("okik"));
+        assert!(p.rejected().contains("okik"));
+        for _ in 0..4 {
+            assert!(p.sight(["okik".to_string()]).is_empty());
+        }
+        assert!(p.undecided(["okik".to_string()]).is_empty());
+        assert_eq!(asked.lock().unwrap().len(), 1, "asked only once");
+        // A rejection recorded by another process counts too.
+        p.note_rejected(["dstry".to_string()]);
+        p.note_sightings([("dstry".to_string(), 5)]);
+        assert!(p.sight(["dstry".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn threshold_is_inclusive_and_configurable() {
+        let p = leak();
+        let (check, _) = stub_check(Some(0.7));
+        assert_eq!(p.vet(commit_twice(p, "figma"), check.as_ref(), 0.7).learned, vec!["figma".to_string()]);
+        let (check, _) = stub_check(Some(0.7));
+        assert_eq!(p.vet(commit_twice(p, "slack"), check.as_ref(), 0.8).rejected, vec!["slack".to_string()]);
+        // A broken setting (NaN) asks for certainty.
+        let (check, _) = stub_check(Some(0.99));
+        assert_eq!(p.vet(commit_twice(p, "npm"), check.as_ref(), f64::NAN).rejected, vec!["npm".to_string()]);
+    }
+
+    #[test]
+    fn failed_check_is_not_recorded_and_retried() {
+        let p = leak();
+        let (failing, asked) = stub_check(None);
+        let due = commit_twice(p, "docker");
+        let vetted = p.vet(due, failing.as_ref(), LEARN_THRESHOLD_DEFAULT);
+        assert!(vetted.learned.is_empty() && vetted.rejected.is_empty());
+        assert_eq!(vetted.retry, vec!["docker".to_string()]);
+        assert!(!p.learned().contains("docker"));
+        assert!(!p.rejected().contains("docker"));
+        assert_eq!(asked.lock().unwrap().len(), 1);
+        // The next commit makes it due again, and a working Jev can learn it.
+        let due = p.sight(["docker".to_string()]);
+        assert_eq!(due, vec!["docker".to_string()]);
+        let (check, _) = stub_check(Some(0.9));
+        assert_eq!(p.vet(due, check.as_ref(), LEARN_THRESHOLD_DEFAULT).learned, vec!["docker".to_string()]);
+
+        // No usable Jev at all (no key, circuit open): postponed the same way.
+        let due = commit_twice(p, "github");
+        p.postpone(due);
+        assert!(!p.learned().contains("github"));
+        assert_eq!(p.sight(["github".to_string()]), vec!["github".to_string()]);
+    }
+
+    #[test]
+    fn word_in_check_is_not_counted_again() {
+        let p = leak();
+        let due = commit_twice(p, "pc");
+        assert_eq!(due.len(), 1);
+        // Committed again while the check runs: not due a second time.
+        assert!(p.sight(["pc".to_string()]).is_empty());
+        assert!(p.sight(["pc".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn background_check_reports_its_result() {
+        let p = leak();
+        let (check, _) = stub_check(Some(0.9));
+        let (tx, rx) = std::sync::mpsc::channel();
+        p.vet_in_background(commit_twice(p, "ssh"), check, LEARN_THRESHOLD_DEFAULT, move |v| {
+            tx.send(v).unwrap();
+        });
+        let vetted = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(vetted.learned, vec!["ssh".to_string()]);
+        assert!(p.learned().contains("ssh"));
     }
 
     #[test]

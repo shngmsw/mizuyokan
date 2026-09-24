@@ -36,6 +36,7 @@ Jev を使う場合は API キーを登録します（後述）。登録しな�
 | 半角/全角キー | `A` ⇔ `あ` |
 | `` Alt+` `` | `A` ⇔ `あ`（US 配列向け） |
 | IME オン / オフ（[alt-ime-ahk](https://github.com/karakaram/alt-ime-ahk) の右 Alt / 左 Alt など） | オン = `あ`、オフ = `A` |
+| IME オン / オフキー（`VK_IME_ON` / `VK_IME_OFF`。AutoHotkey から送る。Chrome など Chromium 系アプリでも効く） | オン = `あ`、オフ = `A` |
 | タスクバーのアイコンをクリック | `A` ⇔ `あ` |
 
 ## しくみ
@@ -115,7 +116,8 @@ $env:JEV_API_KEY = "<key>"; cargo test --test eval jev -- --ignored --nocapture 
   "jev_fail_threshold": 3,
   "jev_cooldown_ms": 60000,
   "debug_log": false,
-  "learn_words": true
+  "learn_words": true,
+  "learn_word_threshold": 0.8
 }
 ```
 
@@ -123,6 +125,8 @@ $env:JEV_API_KEY = "<key>"; cargo test --test eval jev -- --ignored --nocapture 
 - `enable: false`、キー未設定、または API エラーが続くときは、通常の azooKey だけが動きます。
 - `jev_fail_threshold` / `jev_cooldown_ms` で、連続失敗後に Jev を休止する条件を変えられます（既定: 3回 / 60秒）。
 - `learn_words: false` にすると英単語の学習を止めます。覚えた語は `%APPDATA%\Azookey\mizuyokan_words.txt` に1行1語で残ります。消したい語はこのファイルから行を削除してください。
+- 英単語として確定した語は、2回確定したときに覚えます（1回目は `mizuyokan_word_candidates.txt` に記録）。ローマ字として読める語、打っている途中のローマ字（`atta` の途中の `att` など）、英単語らしくない綴り（打ち間違いや乱打）は覚えません。母音の無い5文字までの略語（`ssh`、`pc` など）は覚えます。
+- 覚える直前に、その語が実在する英単語・よく使われる技術用語や略語かを Jev に1回だけ問い合わせ、実在の確率が `learn_word_threshold`（既定 0.8）以上のときだけ覚えます。問い合わせは確定処理とは別に裏で行うので、入力は止まりません。実在しないと判定された語は `%APPDATA%\Azookey\mizuyokan_words_rejected.txt` に記録し、以後は問い合わせません。Jev が使えないとき（キー無し、`enable: false`、エラー、タイムアウト、休止中）は覚えず、記録もしないので、次にその語を確定したときに改めて問い合わせます。
 - `debug_log: true` にすると `%APPDATA%\Azookey\mizuyokan.log` に判定の経過を書きます。**打った文字列が残る**ので、調査のときだけ使ってください。
 - Jev 利用時は、英日判定のために入力ローマ字がゲートウェイ（既定はロリポップ！AIゲートウェイ）へ送られます。キーが無いときは送りません。
 
