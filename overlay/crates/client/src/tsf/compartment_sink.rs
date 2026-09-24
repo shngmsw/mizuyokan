@@ -89,19 +89,10 @@ impl TextServiceFactory {
         self.borrow_mut()?.context = Some(context);
         Ok(())
     }
-}
 
-impl ITfCompartmentEventSink_Impl for TextServiceFactory_Impl {
-    #[macros::anyhow]
-    fn OnChange(&self, rguid: *const GUID) -> Result<()> {
-        if rguid.is_null() || unsafe { *rguid } != GUID_COMPARTMENT_KEYBOARD_OPENCLOSE {
-            return Ok(());
-        }
-
-        let open = read_open(&open_close(self.borrow()?.thread_mgr()?)?)?;
-        let current = IMEState::get()?.input_mode.clone();
-        let target = InputMode::for_open_state(open);
-        if target == current {
+    /// Switch to `target`, ending any composition first. No-op if already there.
+    pub fn switch_input_mode(&self, target: InputMode) -> Result<()> {
+        if IMEState::get()?.input_mode == target {
             return Ok(());
         }
 
@@ -112,7 +103,19 @@ impl ITfCompartmentEventSink_Impl for TextServiceFactory_Impl {
             actions.push(ClientAction::EndComposition);
         }
         actions.push(ClientAction::SetIMEMode(target));
-        self.handle_action(&actions, CompositionState::None)?;
+        self.handle_action(&actions, CompositionState::None)
+    }
+}
+
+impl ITfCompartmentEventSink_Impl for TextServiceFactory_Impl {
+    #[macros::anyhow]
+    fn OnChange(&self, rguid: *const GUID) -> Result<()> {
+        if rguid.is_null() || unsafe { *rguid } != GUID_COMPARTMENT_KEYBOARD_OPENCLOSE {
+            return Ok(());
+        }
+
+        let open = read_open(&open_close(self.borrow()?.thread_mgr()?)?)?;
+        self.switch_input_mode(InputMode::for_open_state(open))?;
 
         Ok(())
     }
