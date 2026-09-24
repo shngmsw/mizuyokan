@@ -72,6 +72,9 @@ static MAP: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
         ("ye", "いぇ"),
         ("tsa", "つぁ"),
         ("xtu", "っ"),
+        ("ltu", "っ"),
+        ("xtsu", "っ"),
+        ("ltsu", "っ"),
         ("xa", "ぁ"),
         ("xi", "ぃ"),
         ("xu", "ぅ"),
@@ -195,7 +198,7 @@ pub(crate) fn scan(romaji: &str) -> (String, Vec<usize>) {
     let mut out = String::new();
     let mut leftovers = Vec::new();
     'outer: while i < lower.len() {
-        for len in (1..=3).rev() {
+        for len in (1..=4).rev() {
             if i + len > lower.len() {
                 continue;
             }
@@ -249,6 +252,16 @@ pub fn hard_leftovers(romaji: &str) -> Vec<usize> {
         .take_while(|c| c.is_ascii_alphabetic() && !"aiueo".contains(c.to_ascii_lowercase()))
         .count()
         .min(2);
+    // Or the start of a longer romaji key ("…lts" of "ltsu").
+    let lower: Vec<char> = romaji.to_lowercase().chars().collect();
+    let key_start = (1..=3.min(lower.len()))
+        .filter(|&k| {
+            let tail: String = lower[lower.len() - k..].iter().collect();
+            MAP.keys().any(|key| key.len() > k && key.starts_with(tail.as_str()))
+        })
+        .max()
+        .unwrap_or(0);
+    let pending = pending.max(key_start);
     let pending_start = chars.len() - pending;
     scan(romaji)
         .1
@@ -311,6 +324,10 @@ mod tests {
         assert_eq!(to_ime_kana("matcha", false), "まっちゃ");
         assert_eq!(to_ime_kana("thi-shatsu", false), "てぃーしゃつ");
         assert_eq!(to_ime_kana("baggu", false), "ばっぐ");
+        assert_eq!(to_ime_kana("ltukoshi", false), "っこし");
+        assert_eq!(to_ime_kana("xtsu", false), "っ");
+        assert_eq!(to_ime_kana("ltsu", false), "っ");
+        assert_eq!(to_ime_kana("tsukau", false), "つかう");
     }
 }
 

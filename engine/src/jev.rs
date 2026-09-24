@@ -63,6 +63,7 @@ fn agent(timeout: Duration) -> ureq::Agent {
 }
 
 const QUESTION: &str = "reading";
+const WORD_QUESTION: &str = "word";
 
 impl JevClient {
     pub fn new(cfg: JevConfig) -> Self {
@@ -78,26 +79,62 @@ impl JevClient {
         if options.len() < 2 {
             return Ok(vec![1.0; options.len()]);
         }
+        self.ask_choice(
+            QUESTION,
+            "A user typed the keystrokes in `raw` into a Japanese IME without switching between Japanese and English.                 Romaji meant as Japanese is converted to kana/kanji; English words are kept as typed.                 Which option is the text the user most likely intended?",
+            serde_json::json!({ "raw": raw }),
+            options,
+        )
+    }
 
+    /// Probability that `word` (lowercase, as committed through the IME) is a
+    /// real English word or an established technical term / abbreviation,
+    /// rather than a typo, key mashing or a fragment of Japanese romaji.
+    /// Used to decide whether the IME should learn the word.
+    pub fn real_word_probability(&self, word: &str) -> Result<f64, JevError> {
+        if self.cfg.api_key.is_empty() {
+            return Err(JevError::MissingKey);
+        }
+        let options = [
+            "A real word: a common English word, or a technical term, command, abbreviation                 or product name widely used in software and IT (for example: ssh, pc, npm,                 kubectl, github, docker, figma, slack)."
+                .to_string(),
+            "Not a real word: a typo, random key mashing, or a fragment of Japanese romaji                 typed without converting (for example: att, ltu, okik, dstry)."
+                .to_string(),
+        ];
+        let probs = self.ask_choice(
+            WORD_QUESTION,
+            "A user of a Japanese IME typed `word` in Latin letters and committed it as English.                 The IME will remember it as an English word only if it really is one.                 Which option describes `word`?",
+            serde_json::json!({ "word": word }),
+            &options,
+        )?;
+        Ok(probs[0])
+    }
+
+    /// One "choice" question; returns one probability per option, in order.
+    fn ask_choice(
+        &self,
+        key: &str,
+        instructions: &str,
+        state: serde_json::Value,
+        options: &[String],
+    ) -> Result<Vec<f64>, JevError> {
         let mut criteria = serde_json::Map::new();
         for (i, option) in options.iter().enumerate() {
             criteria.insert(format!("o{i}"), serde_json::Value::String(option.clone()));
         }
         let mut questions = serde_json::Map::new();
         questions.insert(
-            QUESTION.to_string(),
+            key.to_string(),
             serde_json::json!({
                 "type": "choice",
-                "instructions": "A user typed the keystrokes in `raw` into a Japanese IME without switching between Japanese and English. \
-                    Romaji meant as Japanese is converted to kana/kanji; English words are kept as typed. \
-                    Which option is the text the user most likely intended?",
+                "instructions": instructions,
                 "criteria": criteria,
             }),
         );
 
         let body = SystemOneRequest {
             model: &self.cfg.model,
-            state: serde_json::json!({ "raw": raw }),
+            state,
             questions,
         };
 
@@ -111,14 +148,19 @@ impl JevClient {
         let parsed: serde_json::Value = resp
             .into_json()
             .map_err(|e| JevError::Parse(e.to_string()))?;
-        parse_choice(&parsed, options.len())
+        parse_choice_for(&parsed, key, options.len())
     }
 }
 
+#[cfg(test)]
 fn parse_choice(response: &serde_json::Value, n: usize) -> Result<Vec<f64>, JevError> {
+    parse_choice_for(response, QUESTION, n)
+}
+
+fn parse_choice_for(response: &serde_json::Value, key: &str, n: usize) -> Result<Vec<f64>, JevError> {
     let answer = response
         .get("answers")
-        .and_then(|a| a.get(QUESTION))
+        .and_then(|a| a.get(key))
         .ok_or_else(|| JevError::Parse(format!("no answer in {response}")))?;
 
     if let Some(probs) = answer.get("probabilities").and_then(|p| p.as_object()) {
@@ -176,5 +218,17 @@ mod tests {
             client.choose_reading("abc", &["a".into(), "b".into()]),
             Err(JevError::MissingKey)
         ));
+        assert!(matches!(client.real_word_probability("ssh"), Err(JevError::MissingKey)));
+    }
+
+    #[test]
+    fn parses_word_answer() {
+        let response = serde_json::json!({
+            "answers": { "word": { "type": "choice", "choice": "o0",
+                "probabilities": { "o0": 0.9, "o1": 0.1 } } }
+        });
+        assert_eq!(parse_choice_for(&response, WORD_QUESTION, 2).unwrap(), vec![0.9, 0.1]);
+        // The reading question's answer is not taken for the word question.
+        assert!(parse_choice_for(&response, QUESTION, 2).is_err());
     }
 }

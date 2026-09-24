@@ -200,6 +200,10 @@ fn segment_chunk(chunk: &str, extra_en: &HashSet<String>) -> Vec<Segment> {
                 && !extra_en.contains(&word)
                 && !matches!(prev_kind, Some(Kind::En))
                 && word_hard.iter().all(|&p| p + 2 >= len);
+            // Fully readable after Japanese ("sakkiitta|you|ni" = ように): Japanese.
+            if ambiguous_stem && len <= 3 && i > 0 && crate::romaji::scan(&word).1.is_empty() {
+                continue;
+            }
             if ambiguous_stem && len <= 3 {
                 let after = i + len;
                 let continues_en = (2..=(n - after).min(24)).any(|l| {
@@ -381,6 +385,15 @@ fn segment_chunk(chunk: &str, extra_en: &HashSet<String>) -> Vec<Segment> {
             _ => segments.push(Segment { kind, raw, surface }),
         }
     }
+    // Piecewise kana can leave a sokuon letter behind ("あtt", "ざsし"); the
+    // options Jev sees are these surfaces, and garbled Japanese loses to English.
+    for s in segments.iter_mut().filter(|s| s.kind == SegmentKind::Ja) {
+        let latin = |t: &str| t.chars().filter(|c| c.is_ascii_alphabetic()).count();
+        let whole = to_ime_kana(&s.raw, false);
+        if latin(&whole) < latin(&s.surface) {
+            s.surface = whole;
+        }
+    }
     segments
 }
 
@@ -509,8 +522,8 @@ fn plausible(cand: &[Segment], extra_en: &HashSet<String>) -> bool {
     let known = |w: &str| EN_WORDS.contains(w) || PROPER.contains_key(w) || extra_en.contains(w);
     // Fine as romaji; a final n is ん still being typed ("hen").
     let readable = |w: &str| {
-        let body = w.strip_suffix('n').filter(|b| !b.is_empty()).unwrap_or(w);
-        crate::romaji::scan(body).1.is_empty()
+        let left = crate::romaji::scan(w).1;
+        left.is_empty() || (w.len() > 1 && w.ends_with('n') && left == [w.len() - 1])
     };
     for (i, seg) in cand.iter().enumerate() {
         let lower = seg.raw.to_ascii_lowercase();
@@ -546,9 +559,36 @@ fn plausible(cand: &[Segment], extra_en: &HashSet<String>) -> bool {
                     if cut && !known(&last_word) {
                         return false;
                     }
+                    // "at|ta", "kit|te", "mecc|ha": the English side's closing
+                    // consonant belongs to the next kana (った, って, っちゃ).
+                    // Short known words are cut this way too ("set|tei").
+                    let typed_upper = cand[i - 1]
+                        .surface
+                        .rsplit(' ')
+                        .next()
+                        .is_some_and(|w| w.starts_with(|c: char| c.is_ascii_uppercase()));
+                    if !typed_upper
+                        && (!known(&last_word) || last_word.len() <= 3)
+                        && cuts_syllable(&prev, &lower, false)
+                    {
+                        return false;
+                    }
                 }
             }
             SegmentKind::En => {
+                // "at", "att", "kit": romaji still being typed (あっt), not an
+                // English word. A known or capitalized word is still offered.
+                if i + 1 == cand.len() {
+                    if let Some(word) = seg.surface.rsplit(' ').next().filter(|w| w.is_ascii()) {
+                        let w = word.to_ascii_lowercase();
+                        if !known(&w)
+                            && !word.starts_with(|c: char| c.is_ascii_uppercase())
+                            && hard_leftovers(&w).is_empty()
+                        {
+                            return false;
+                        }
+                    }
+                }
                 for word in seg.surface.split(' ').filter(|w| w.is_ascii()) {
                     let w = word.to_ascii_lowercase();
                     if !known(&w) && swallows_particle(word, &known) {
@@ -568,6 +608,26 @@ fn plausible(cand: &[Segment], extra_en: &HashSet<String>) -> bool {
         }
     }
     true
+}
+
+/// "at|ta", "mecc|ha": the consonants closing `left` are read together with
+/// the start of `right` as one kana syllable (った, っちゃ), so the boundary
+/// runs through a syllable. A closing "n" (ん) is only counted with
+/// `count_n`: English often ends in n before a particle ("kotlin|de").
+pub(crate) fn cuts_syllable(left: &str, right: &str, count_n: bool) -> bool {
+    let tail: Vec<char> = left
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_alphabetic() && !"aiueoAIUEO".contains(*c))
+        .collect();
+    let Some(&first) = tail.last() else {
+        return false;
+    };
+    if !right.starts_with(|c: char| c.is_ascii_alphabetic()) || (!count_n && first.eq_ignore_ascii_case(&'n')) {
+        return false;
+    }
+    let joined: String = tail.iter().rev().chain(right.chars().collect::<Vec<_>>().iter()).collect();
+    !crate::romaji::scan(&joined).1.contains(&0)
 }
 
 /// "terraformwoa|pply", "sampleco|de": the seam between English and Japanese
@@ -714,12 +774,11 @@ pub fn words_to_learn(committed: &str, segments: &[Segment]) -> Vec<String> {
     for s in segments.iter().filter(|s| s.kind == SegmentKind::En) {
         for word in s.surface.split(' ') {
             let lower = word.to_ascii_lowercase();
-            if lower.len() < 2
-                || !lower.chars().all(|c| c.is_ascii_lowercase())
+            if !lower.chars().all(|c| c.is_ascii_lowercase())
                 || !committed.contains(word)
                 || EN_WORDS.contains(lower.as_str())
                 || PROPER.contains_key(lower.as_str())
-                || crate::romaji::scan(&lower).1.is_empty()
+                || !worth_learning(word)
                 || out.contains(&lower)
             {
                 continue;
@@ -728,6 +787,50 @@ pub fn words_to_learn(committed: &str, segments: &[Segment]) -> Vec<String> {
         }
     }
     out
+}
+
+/// Whether a committed English word (as typed) looks like a real word rather
+/// than romaji or a typo. Only decides what gets learned from now on; words
+/// already in the learned list are loaded as they are.
+pub fn worth_learning(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    if lower.len() < 2 || !lower.chars().all(|c| c.is_ascii_lowercase()) {
+        return false;
+    }
+    // Readable as romaji: Japanese ("ltu" = っ).
+    if crate::romaji::scan(&lower).1.is_empty() {
+        return false;
+    }
+    let chars: Vec<char> = lower.chars().collect();
+    if chars.iter().all(|&c| c == chars[0]) {
+        return false; // "kk", "aaa": key mashing
+    }
+    let is_vowel = |c: char| "aeiouy".contains(c);
+    if !chars.iter().any(|&c| is_vowel(c)) {
+        // Acronyms (ssh, pc, npm, https) have no vowels; longer runs are mashing.
+        return chars.len() <= 5;
+    }
+    // Romaji still being typed ("att" of "atta", "on" of "onaji"): a letter or
+    // two more would make it Japanese. Real words of that shape ("bot") are
+    // left out too; learning them would pull "botan" towards English.
+    if pending_romaji(&lower) {
+        return false;
+    }
+    let runs: Vec<usize> = lower.split(is_vowel).map(str::len).collect();
+    // English starts with at most three consonants (str, spl) and rarely
+    // stacks five inside a word; "dstry", "yoiunsmsrfr" do.
+    runs[0] <= 3 && runs.iter().all(|&n| n <= 4)
+}
+
+/// `word` is not romaji yet, but becomes romaji with one or two more letters.
+fn pending_romaji(word: &str) -> bool {
+    const LETTERS: &str = "abcdefghijklmnopqrstuvwxyz";
+    LETTERS.chars().any(|a| {
+        crate::romaji::scan(&format!("{word}{a}")).1.is_empty()
+            || LETTERS
+                .chars()
+                .any(|b| crate::romaji::scan(&format!("{word}{a}{b}")).1.is_empty())
+    })
 }
 
 /// Returns (committed_surface, rest_raw) when composition contains sentence-end punct.
@@ -830,6 +933,73 @@ mod tests {
         }
     }
 
+    /// Small tsu, ん and syllables still being typed: every keystroke of these
+    /// is Japanese, offline and in the options Jev chooses from ("att" must
+    /// not be offered as English, or "atta" shows as "attあ").
+    const SOKUON_AND_N: &[&str] = &[
+        "atta", "motto", "kitte", "zutto", "chotto", "matte", "yappari", "kekkou", "sakki",
+        "ippai", "konnnichiha", "kan'i", "tsukau", "xtukoshi", "ltukoshi", "ltsu", "hon",
+        "honwoyomu", "kitto", "gakkou", "zasshi", "mecchakucha", "kotchi", "tokkyo",
+    ];
+
+    #[test]
+    fn sokuon_prefixes_are_never_english() {
+        for word in SOKUON_AND_N {
+            let chars: Vec<char> = word.chars().collect();
+            for k in 1..=chars.len() {
+                let prefix: String = chars[..k].iter().collect();
+                assert!(
+                    segment(&prefix).iter().all(|s| s.kind != SegmentKind::En),
+                    "offline {prefix}: {:?}",
+                    segment(&prefix)
+                );
+                let alts = alternatives(&prefix, 8);
+                assert!(
+                    alts.iter().all(|a| a.iter().all(|s| s.kind != SegmentKind::En)),
+                    "options {prefix}: {:?}",
+                    alts.iter().map(|a| render_offline(a)).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sokuon_is_rendered_as_small_tsu() {
+        assert_eq!(live_convert("att").surface, "あっt");
+        assert_eq!(live_convert("zasshi").surface, "ざっし");
+        assert_eq!(live_convert("kotchi").surface, "こっち");
+        assert_eq!(live_convert("mecchakucha").surface, "めっちゃくちゃ");
+        assert_eq!(live_convert("xtukoshi").surface, "っこし");
+    }
+
+    #[test]
+    fn english_is_still_offered_next_to_sokuon() {
+        // Known, capitalized or unreadable English stays on offer.
+        let has = |raw: &str, want: &str| {
+            alternatives(raw, 8).iter().any(|a| render_offline(a) == want)
+        };
+        assert!(has("git", "git"));
+        assert!(has("Att", "Att"));
+        assert!(has("Slackdezuttomatteta", "Slackでずっとまってた"));
+        assert!(has("reviewshitemitakedoyappari", "reviewしてみたけどやっぱり"));
+        assert_eq!(shape("PRwokittekudasai")[0], en("PR"));
+        // "you" after Japanese is よう, at the start it is English.
+        assert!(segment("sakkiittayouni").iter().all(|s| s.kind != SegmentKind::En));
+        assert_eq!(shape("yoursessionhasexpiredto")[0], en("yoursessionhasexpired"));
+    }
+
+    #[test]
+    fn syllable_cut_at_the_seam() {
+        assert!(cuts_syllable("at", "ta", false));
+        assert!(cuts_syllable("att", "a", false));
+        assert!(cuts_syllable("mecc", "ha", false));
+        assert!(!cuts_syllable("git", "pull", false));
+        assert!(!cuts_syllable("Zoom", "de", false));
+        assert!(!cuts_syllable("data", "tte", false));
+        assert!(!cuts_syllable("kotlin", "de", false));
+        assert!(cuts_syllable("kotlin", "de", true));
+    }
+
     #[test]
     fn long_vowel_is_fullwidth() {
         assert_eq!(live_convert("ko-hi-").surface, "こーひー");
@@ -885,6 +1055,34 @@ mod tests {
         ];
         assert_eq!(words_to_learn("Figmaのmake git", &segments), vec!["figma"]);
         assert!(words_to_learn("ふぃgmaの", &segments).is_empty());
+    }
+
+    /// Words that were actually learned before the rules were tightened.
+    #[test]
+    fn learning_rejects_romaji_fragments_and_typos() {
+        let table = [
+            ("att", false),         // "atta" still being typed
+            ("ut", false),          // "uta"…
+            ("altultu", false),     // あっっ
+            ("ltu", false),         // っ
+            ("ssh", true),
+            ("yoiunsmsrfr", false), // mashing
+            ("dstry", false),       // typo
+            ("on", false),          // "onaji"…
+            ("pc", true),
+        ];
+        for (word, learn) in table {
+            let segments = [Segment { kind: SegmentKind::En, raw: word.into(), surface: word.into() }];
+            let got = words_to_learn(word, &segments);
+            assert_eq!(!got.is_empty(), learn, "{word}: {got:?}");
+        }
+        for word in ["figma", "docker", "slack", "github", "kubectl", "npm", "https", "strength"] {
+            assert!(worth_learning(word), "{word}");
+        }
+        for word in ["kk", "sdfghjk", "ky", "tt"] {
+            assert!(!worth_learning(word), "{word}");
+        }
+        assert!(!worth_learning("Bot"), "could be ぼt of ぼたん");
     }
 
     #[test]

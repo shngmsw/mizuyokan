@@ -99,6 +99,7 @@ fn offline_and_options() {
     let mut offline = Score::new();
     let mut options = Score::new();
     let mut japanese_kept = Score::new();
+    let mut japanese_prefixes = Score::new();
     for case in cases() {
         let got = mask(&segment(&case.raw));
         offline.add(got == case.english, || {
@@ -114,15 +115,29 @@ fn offline_and_options() {
         });
         if case.english.iter().all(|&e| !e) {
             japanese_kept.add(got.iter().all(|&e| !e), || show(&case.raw, &got));
+            // Every keystroke on the way: Jev must not even be offered English
+            // for a Japanese word being typed ("att" before "atta").
+            let chars: Vec<char> = case.raw.chars().collect();
+            let offered = (2..=chars.len()).find_map(|k| {
+                let prefix: String = chars[..k].iter().collect();
+                alternatives(&prefix, 8)
+                    .into_iter()
+                    .find(|a| a.iter().any(|s| s.kind == SegmentKind::En))
+                    .map(|a| format!("{prefix} -> {}", render_offline(&a)))
+            });
+            japanese_prefixes.add(offered.is_none(), || offered.unwrap());
         }
     }
     offline.report("offline");
     options.report("options");
     japanese_kept.report("japanese kept japanese (offline)");
+    japanese_prefixes.report("japanese never offered as english while typing");
 
     // Regression floors: raise them when the numbers improve.
-    assert!(offline.hit >= 43, "offline accuracy dropped");
-    assert!(options.hit >= 69, "option coverage dropped");
+    assert!(offline.hit >= 59, "offline accuracy dropped");
+    assert!(options.hit >= 88, "option coverage dropped");
+    // Misses left: get/set/ok (known short words, still Jev's call) and "purogurammi".
+    assert!(japanese_prefixes.hit >= 33, "English offered for Japanese being typed");
     // "purogurammingu": mm is not read as っ on purpose (see romaji.rs), so
     // this one stays a known miss.
     assert!(japanese_kept.hit + 1 >= japanese_kept.total, "Japanese read as English offline");

@@ -84,3 +84,23 @@ ohayougozaimasu
 tsukaretanode
 hontounidesuka
 kinoushuppatsushita
+
+# small tsu (tt, kk, pp...), nn / n' and pending prefixes ("att", "kit") are Japanese
+attakedo
+mottoyasukushite
+kittekudasai
+zuttomatteta
+chottomatte
+yapparisoudesune
+kekkouisogashii
+sakkiittayouni
+ippaiarimasu
+konnnichiha
+kan'inasettei
+tsukattemimasu
+honwoyomu
+[review]shitemitakedoyappariokashii
+[deploy]shitakedochottomatte
+[Slack]dezuttomatteta
+[PR]wokittekudasai
+[Figma]demottoyokusuru

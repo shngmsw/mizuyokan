@@ -14,7 +14,8 @@ use std::{
 
 use anyhow::Result;
 use mizuyokan_engine::{
-    jev_judge, words_to_learn, JevConfig, Judgement, Prefetcher, Segment, SegmentKind,
+    jev_judge, jev_word_check, words_to_learn, JevConfig, Judgement, Prefetcher, Segment,
+    SegmentKind, Vetted, LEARN_THRESHOLD_DEFAULT,
 };
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +28,14 @@ const SETTINGS_FILENAME: &str = "mizuyokan.json";
 /// English words learned from commits, one per line. Shared by every app
 /// that loads the IME; each process appends what it learns.
 const WORDS_FILENAME: &str = "mizuyokan_words.txt";
+/// Words committed but not learned yet, one line per commit. A word moves to
+/// WORDS_FILENAME once it has LEARN_AFTER_COMMITS lines here.
+const CANDIDATES_FILENAME: &str = "mizuyokan_word_candidates.txt";
+/// Words Jev judged not to be real English, one per line: never learned and
+/// never asked about again. Checks that failed are not written here.
+const REJECTED_FILENAME: &str = "mizuyokan_words_rejected.txt";
+/// Past this many lines the candidates file is started over.
+const MAX_CANDIDATE_LINES: usize = 2000;
 /// Defaults match karukan's idea of adaptive degrade: a few bad calls and we
 /// stop waiting on the enhancement layer so typing stays on plain azooKey.
 const JEV_FAIL_THRESHOLD_DEFAULT: u32 = 3;
@@ -52,6 +61,9 @@ pub struct Settings {
     /// Remember committed English words (mizuyokan_words.txt) so they are
     /// recognised offline next time.
     pub learn_words: bool,
+    /// A word is learned only when Jev puts the probability that it is a real
+    /// English word / technical term at or above this (0.0 - 1.0).
+    pub learn_word_threshold: f64,
 }
 
 impl Default for Settings {
@@ -66,6 +78,7 @@ impl Default for Settings {
             jev_cooldown_ms: JEV_COOLDOWN_DEFAULT.as_millis() as u64,
             debug_log: false,
             learn_words: true,
+            learn_word_threshold: LEARN_THRESHOLD_DEFAULT,
         }
     }
 }
@@ -101,6 +114,7 @@ struct Loaded {
     cooldown: Duration,
     debug_log: bool,
     learn_words: bool,
+    learn_word_threshold: f64,
 }
 
 impl Default for Loaded {
@@ -111,6 +125,7 @@ impl Default for Loaded {
             cooldown: JEV_COOLDOWN_DEFAULT,
             debug_log: false,
             learn_words: true,
+            learn_word_threshold: LEARN_THRESHOLD_DEFAULT,
         }
     }
 }
@@ -145,6 +160,7 @@ fn loaded() -> Loaded {
         cooldown: Duration::from_millis(settings.jev_cooldown_ms.max(1)),
         debug_log: settings.debug_log,
         learn_words: settings.learn_words,
+        learn_word_threshold: settings.learn_word_threshold,
     };
     *cache = Some((modified, loaded.clone()));
     drop(cache);
@@ -273,6 +289,22 @@ fn monitored_judge(config: JevConfig) -> std::sync::Arc<mizuyokan_engine::Judge>
     })
 }
 
+/// Jev "is this a real word?" check for learning; API errors count towards
+/// the circuit breaker like any other Jev call.
+fn monitored_word_check(config: JevConfig) -> std::sync::Arc<mizuyokan_engine::WordCheck> {
+    let inner = jev_word_check(config);
+    std::sync::Arc::new(move |word: &str| match inner(word) {
+        Some(p) => {
+            note_jev_success();
+            Some(p)
+        }
+        None => {
+            note_jev_failure("word check");
+            None
+        }
+    })
+}
+
 mod dpapi {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use windows::Win32::{
@@ -301,28 +333,62 @@ fn words_path() -> Option<PathBuf> {
     Settings::path().map(|p| p.with_file_name(WORDS_FILENAME))
 }
 
-/// Pull in words other processes learned since the last look (by mtime).
-fn load_learned() {
-    static SEEN: LazyLock<Mutex<Option<SystemTime>>> = LazyLock::new(|| Mutex::new(None));
-    let Some(path) = words_path() else {
-        return;
-    };
-    let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
-        return;
-    };
-    let Ok(mut seen) = SEEN.lock() else {
-        return;
-    };
+fn candidates_path() -> Option<PathBuf> {
+    Settings::path().map(|p| p.with_file_name(CANDIDATES_FILENAME))
+}
+
+fn rejected_path() -> Option<PathBuf> {
+    Settings::path().map(|p| p.with_file_name(REJECTED_FILENAME))
+}
+
+/// The file's text when it changed since the last call for the same `seen` (by mtime).
+fn read_if_changed(path: Option<PathBuf>, seen: &Mutex<Option<SystemTime>>) -> Option<String> {
+    let path = path?;
+    let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+    let mut seen = seen.lock().ok()?;
     if *seen == Some(modified) {
-        return;
+        return None;
     }
     *seen = Some(modified);
-    if let Ok(text) = std::fs::read_to_string(&path) {
-        Prefetcher::global().remember(
-            text.lines()
-                .map(|l| l.trim().to_ascii_lowercase())
-                .filter(|w| !w.is_empty()),
-        );
+    std::fs::read_to_string(&path).ok()
+}
+
+fn file_words(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.lines()
+        .map(|l| l.trim().to_ascii_lowercase())
+        .filter(|w| !w.is_empty())
+}
+
+/// Pull in words (and commit counts) other processes recorded since the last look.
+/// Learned words are taken as they are, without today's `words_to_learn` rules.
+fn load_learned() {
+    static WORDS_SEEN: LazyLock<Mutex<Option<SystemTime>>> = LazyLock::new(|| Mutex::new(None));
+    static CANDIDATES_SEEN: LazyLock<Mutex<Option<SystemTime>>> =
+        LazyLock::new(|| Mutex::new(None));
+    static REJECTED_SEEN: LazyLock<Mutex<Option<SystemTime>>> = LazyLock::new(|| Mutex::new(None));
+    if let Some(text) = read_if_changed(words_path(), &WORDS_SEEN) {
+        Prefetcher::global().remember(file_words(&text));
+    }
+    if let Some(text) = read_if_changed(rejected_path(), &REJECTED_SEEN) {
+        Prefetcher::global().note_rejected(file_words(&text));
+    }
+    if let Some(text) = read_if_changed(candidates_path(), &CANDIDATES_SEEN) {
+        let mut counts = std::collections::HashMap::<String, usize>::new();
+        for word in file_words(&text) {
+            *counts.entry(word).or_default() += 1;
+        }
+        Prefetcher::global().note_sightings(counts);
+    }
+}
+
+fn append_lines(path: Option<PathBuf>, words: &[String]) {
+    use std::io::Write as _;
+    if let Some(mut file) =
+        path.and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok())
+    {
+        let _ = file.write_all(format!("{}
+", words.join("
+")).as_bytes());
     }
 }
 
@@ -336,18 +402,58 @@ pub fn learn(committed: &str, segments: Option<&[Segment]>) {
         return;
     }
     load_learned();
-    let new = Prefetcher::global().remember(words_to_learn(committed, segments));
-    if new.is_empty() {
+    let prefetcher = Prefetcher::global();
+    // Learned, rejected by Jev, or being checked right now: nothing to count.
+    let candidates = prefetcher.undecided(words_to_learn(committed, segments));
+    if candidates.is_empty() {
         return;
     }
-    debug_log!("learned {new:?}");
-    use std::io::Write as _;
-    if let Some(mut file) = words_path().and_then(|p| {
-        std::fs::OpenOptions::new().create(true).append(true).open(p).ok()
-    }) {
-        let _ = file.write_all(format!("{}
-", new.join("
-")).as_bytes());
+    let due = prefetcher.sight(candidates.clone());
+    let pending: Vec<String> = candidates.into_iter().filter(|w| !due.contains(w)).collect();
+    if !pending.is_empty() {
+        debug_log!("seen once {pending:?}");
+        let path = candidates_path();
+        let too_long = path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .is_some_and(|t| t.lines().count() >= MAX_CANDIDATE_LINES);
+        if too_long {
+            if let Some(p) = &path {
+                let _ = std::fs::write(p, "");
+            }
+        }
+        append_lines(path, &pending);
+    }
+    if due.is_empty() {
+        return;
+    }
+    // Only words Jev calls real are learned. The check runs on a background
+    // thread so a commit never waits for it; without a usable Jev nothing is
+    // learned and the words are checked again on their next commit.
+    match jev_ready() {
+        Some(config) => {
+            let threshold = loaded().learn_word_threshold;
+            prefetcher.vet_in_background(due, monitored_word_check(config), threshold, record_vetted);
+        }
+        None => {
+            debug_log!("word check skipped (no usable Jev): not learning {due:?} yet");
+            prefetcher.postpone(due);
+        }
+    }
+}
+
+/// Store the outcome of a word check (runs on the check's thread).
+fn record_vetted(vetted: Vetted) {
+    if !vetted.learned.is_empty() {
+        debug_log!("learned {:?}", vetted.learned);
+        append_lines(words_path(), &vetted.learned);
+    }
+    if !vetted.rejected.is_empty() {
+        debug_log!("not learned (Jev: not a real word) {:?}", vetted.rejected);
+        append_lines(rejected_path(), &vetted.rejected);
+    }
+    if !vetted.retry.is_empty() {
+        debug_log!("word check failed: not learning {:?} yet", vetted.retry);
     }
 }
 
@@ -644,6 +750,8 @@ mod tests {
         assert_eq!(parsed.jev_cooldown_ms, 60_000);
         assert_eq!(parsed.jev_model, "typesafe/jev-latest");
         assert!(parsed.learn_words);
+        assert_eq!(parsed.learn_word_threshold, 0.8);
+        assert_eq!(Settings::parse(r#"{"learn_word_threshold": 0.7}"#).learn_word_threshold, 0.7);
         assert_eq!(Settings::parse("{ not json"), Settings::default());
         assert!(Settings::default().jev_config().is_none());
         let disabled = Settings { enable: false, jev_api_key_dpapi: "x".into(), ..Default::default() };
