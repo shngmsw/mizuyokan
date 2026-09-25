@@ -18,6 +18,9 @@ pub enum ClientAction {
     /// buffer so that what gets committed keeps its English words.
     Settle,
 
+    /// Switch between the mixed reading (English spans) and the all-Japanese one (Tab).
+    TogglePlain,
+
     SetIMEMode(InputMode),
 }
 

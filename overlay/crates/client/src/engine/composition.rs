@@ -52,6 +52,10 @@ pub struct Composition {
     /// Segmentation behind azooKey's current composing text when it was fed with
     /// English spans (see `mizuyokan::sync`); `None` for a plain azooKey feed.
     pub mixed: Option<Vec<mizuyokan_engine::Segment>>,
+    /// The mixed segmentation the user switched away from (Tab, or Space past
+    /// the last candidate); azooKey holds the plain reading until the input
+    /// is edited. `None` when there was no such switch.
+    pub plain_override: Option<Vec<mizuyokan_engine::Segment>>,
 }
 
 impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
@@ -185,6 +189,12 @@ impl TextServiceFactory {
                         ClientAction::SetIMEMode(InputMode::Latin),
                     ],
                 ),
+                UserAction::Tab
+                    if composition.plain_override.is_some()
+                        || super::mizuyokan::has_english(composition.mixed.as_deref()) =>
+                {
+                    (CompositionState::Previewing, vec![ClientAction::TogglePlain])
+                }
                 UserAction::Space | UserAction::Tab => (
                     CompositionState::Previewing,
                     vec![ClientAction::SetSelection(SetSelectionType::Down)],
@@ -273,6 +283,12 @@ impl TextServiceFactory {
                         ClientAction::SetIMEMode(InputMode::Latin),
                     ],
                 ),
+                UserAction::Tab
+                    if composition.plain_override.is_some()
+                        || super::mizuyokan::has_english(composition.mixed.as_deref()) =>
+                {
+                    (CompositionState::Previewing, vec![ClientAction::TogglePlain])
+                }
                 UserAction::Space | UserAction::Tab => (
                     CompositionState::Previewing,
                     vec![ClientAction::SetSelection(SetSelectionType::Down)],
@@ -356,6 +372,7 @@ impl TextServiceFactory {
         let mut transition = transition;
         let mut new_mode: Option<InputMode> = None;
         let mut mixed = composition.mixed.clone();
+        let mut plain_override = composition.plain_override.clone();
         // Escape and the last Backspace end the composition through RemoveText:
         // that is a cancel, not a commit, so nothing is learned from it.
         let mut cancelled = false;
@@ -371,7 +388,10 @@ impl TextServiceFactory {
                 }
                 ClientAction::EndComposition => {
                     if !cancelled {
-                        super::mizuyokan::learn(&format!("{preview}{suffix}"), mixed.as_deref());
+                        match &plain_override {
+                            Some(turned_down) => super::mizuyokan::unlearn(turned_down, usize::MAX),
+                            None => super::mizuyokan::learn(&format!("{preview}{suffix}"), mixed.as_deref()),
+                        }
                     }
                     self.end_composition()?;
                     selection_index = 0;
@@ -381,11 +401,14 @@ impl TextServiceFactory {
                     raw_input.clear();
                     raw_hiragana.clear();
                     mixed = None;
+                    plain_override = None;
                     ipc_service.hide_window()?;
                     ipc_service.set_candidates(vec![])?;
                     ipc_service.clear_text()?;
                 }
                 ClientAction::AppendText(text) => {
+                    // Editing the input: back to judging it.
+                    plain_override = None;
                     raw_input.push_str(&text);
                     if mode == InputMode::Kana {
                         super::mizuyokan::prefetch(&raw_input);
@@ -424,6 +447,7 @@ impl TextServiceFactory {
                 }
                 ClientAction::RemoveText => {
                     cancelled = true;
+                    plain_override = None;
                     candidates = ipc_service.remove_text()?;
                     corresponding_count = candidates
                         .corresponding_count
@@ -494,10 +518,11 @@ impl TextServiceFactory {
                     raw_input.clear();
                     raw_hiragana.clear();
                     mixed = None;
+                    plain_override = None;
                     ipc_service.clear_text()?;
                 }
                 ClientAction::Settle => {
-                    if mode == InputMode::Kana {
+                    if mode == InputMode::Kana && plain_override.is_none() {
                         if let Some((settled, segments)) = super::mizuyokan::sync(
                             &raw_input,
                             mixed.is_some(),
@@ -520,10 +545,34 @@ impl TextServiceFactory {
                         }
                     }
                 }
+                ClientAction::TogglePlain => {
+                    // Back to the mixed reading turned down earlier, or away from it.
+                    let (feed, next_mixed, next_override) = match &plain_override {
+                        Some(turned_down) => (Some(turned_down.clone()), Some(turned_down.clone()), None),
+                        None => (None, None, mixed.clone()),
+                    };
+                    if let Some(fed) =
+                        super::mizuyokan::refeed(&raw_input, feed.as_deref(), &mut ipc_service)
+                    {
+                        candidates = fed;
+                        mixed = next_mixed;
+                        plain_override = next_override;
+                        selection_index = 0;
+                        let first = |list: &Vec<String>| list.first().cloned().unwrap_or_default();
+                        preview = first(&candidates.texts);
+                        suffix = first(&candidates.sub_texts);
+                        raw_hiragana = candidates.hiragana.clone();
+                        corresponding_count = candidates.corresponding_count.first().cloned().unwrap_or(0);
+                        self.set_text(&preview, &suffix)?;
+                        ipc_service.set_candidates(candidates.texts.clone())?;
+                        ipc_service.set_selection(selection_index)?;
+                    }
+                }
                 ClientAction::SetSelection(selection) => {
                     let first_conversion = matches!(selection, SetSelectionType::Down)
                         && composition.state == CompositionState::Composing
-                        && mode == InputMode::Kana;
+                        && mode == InputMode::Kana
+                        && plain_override.is_none();
                     super::mizuyokan::trace(&format!(
                         "set_selection {selection:?} state={:?} mode={mode:?} raw={raw_input:?} first_conversion={first_conversion}",
                         composition.state
@@ -551,6 +600,22 @@ impl TextServiceFactory {
                         }
                     }
 
+                    // Space past the last mixed candidate: the all-Japanese reading.
+                    // Only once converting, so the first Space never skips the mixed one.
+                    let past_end = matches!(selection, SetSelectionType::Down)
+                        && composition.state == CompositionState::Previewing
+                        && selection_index + 1 >= candidates.texts.len() as i32
+                        && super::mizuyokan::has_english(mixed.as_deref());
+                    if past_end {
+                        if let Some(plain) = super::mizuyokan::refeed(&raw_input, None, &mut ipc_service) {
+                            candidates = plain;
+                            plain_override = mixed.take();
+                            ipc_service.set_candidates(candidates.texts.clone())?;
+                            // Down below lands on the first plain candidate.
+                            selection_index = -1;
+                        }
+                    }
+
                     let texts = candidates.texts.clone();
                     let sub_texts = candidates.sub_texts.clone();
 
@@ -574,7 +639,13 @@ impl TextServiceFactory {
                 }
                 ClientAction::ShrinkText(text) => {
                     // `preview` is the part being committed.
-                    super::mizuyokan::learn(&preview, mixed.as_deref());
+                    match &plain_override {
+                        Some(turned_down) => {
+                            super::mizuyokan::unlearn(turned_down, corresponding_count as usize)
+                        }
+                        None => super::mizuyokan::learn(&preview, mixed.as_deref()),
+                    }
+                    plain_override = None;
                     // shrink text
                     raw_input.push_str(&text);
                     raw_input = raw_input
@@ -612,10 +683,16 @@ impl TextServiceFactory {
                     transition = CompositionState::Composing;
                 }
                 ClientAction::SetTextWithType(set_type) => {
+                    // azooKey's reading holds English spans as letters; read them as kana too.
+                    let hiragana = if super::mizuyokan::has_english(mixed.as_deref()) {
+                        super::mizuyokan::hiragana(&raw_input)
+                    } else {
+                        raw_hiragana.clone()
+                    };
                     let text = match set_type {
-                        SetTextType::Hiragana => raw_hiragana.clone(),
-                        SetTextType::Katakana => to_katakana(&raw_hiragana),
-                        SetTextType::HalfKatakana => to_half_katakana(&raw_hiragana),
+                        SetTextType::Hiragana => hiragana,
+                        SetTextType::Katakana => to_katakana(&hiragana),
+                        SetTextType::HalfKatakana => to_half_katakana(&hiragana),
                         SetTextType::FullLatin => to_fullwidth(&raw_input, true),
                         SetTextType::HalfLatin => to_halfwidth(&raw_input),
                     };
@@ -638,6 +715,7 @@ impl TextServiceFactory {
             composition.suffix = suffix.clone();
             composition.corresponding_count = corresponding_count;
             composition.mixed = mixed;
+            composition.plain_override = plain_override;
         }
 
         if let Some(mode) = new_mode {
