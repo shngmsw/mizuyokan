@@ -388,13 +388,19 @@ fn segment_chunk(chunk: &str, extra_en: &HashSet<String>) -> Vec<Segment> {
     // Piecewise kana can leave a sokuon letter behind ("あtt", "ざsし"); the
     // options Jev sees are these surfaces, and garbled Japanese loses to English.
     for s in segments.iter_mut().filter(|s| s.kind == SegmentKind::Ja) {
-        let latin = |t: &str| t.chars().filter(|c| c.is_ascii_alphabetic()).count();
-        let whole = to_ime_kana(&s.raw, false);
-        if latin(&whole) < latin(&s.surface) {
-            s.surface = whole;
-        }
+        rekana(s);
     }
     segments
+}
+
+/// Read a Japanese segment's raw again as a whole when that leaves fewer
+/// letters than its piecewise kana ("ぷt" + "と" → "ぷっと").
+fn rekana(s: &mut Segment) {
+    let latin = |t: &str| t.chars().filter(|c| c.is_ascii_alphabetic()).count();
+    let whole = to_ime_kana(&s.raw, false);
+    if latin(&whole) < latin(&s.surface) {
+        s.surface = whole;
+    }
 }
 
 pub(crate) fn push_other(segments: &mut Vec<Segment>, raw: char, surface: char) {
@@ -500,6 +506,9 @@ pub(crate) fn merge_adjacent(segments: Vec<Segment>) -> Vec<Segment> {
                 }
                 last.raw.push_str(&s.raw);
                 last.surface.push_str(&s.surface);
+                if s.kind == SegmentKind::Ja {
+                    rekana(last);
+                }
             }
             _ => out.push(s),
         }
@@ -970,6 +979,14 @@ mod tests {
         assert_eq!(live_convert("kotchi").surface, "こっち");
         assert_eq!(live_convert("mecchakucha").surface, "めっちゃくちゃ");
         assert_eq!(live_convert("xtukoshi").surface, "っこし");
+    }
+
+    #[test]
+    fn merged_japanese_is_read_again_across_the_seam() {
+        // "put" flipped to Japanese is "ぷt"; joined with "to" it must read "ぷっと".
+        assert_eq!(render_offline(&as_japanese("autoputto")), "あうとぷっと");
+        let alts: Vec<String> = alternatives("autoputto", 8).iter().map(|a| render_offline(a)).collect();
+        assert!(alts.contains(&"あうとぷっと".to_string()), "{alts:?}");
     }
 
     #[test]
