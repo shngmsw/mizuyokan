@@ -82,14 +82,17 @@ impl Chunk<'_> {
         }
         let word = self.word(i, j);
         let typed = &self.original[i..j];
-        if self.lexicon.blocked.contains(&word) && !typed[0].is_ascii_uppercase() {
+        let typed_word: String = typed.iter().collect();
+        let known = self.lexicon.is_en_as_typed(&typed_word);
+        // Turned down by the user, alone or inside an unknown word ("reviewsh").
+        if !known && self.lexicon.hides_blocked(&typed_word) {
             return None;
         }
         let evidence = self.evidence(i, j);
         let mut score = PIECE_COST;
         score += if self.lexicon.is_learned(&word) {
             20 + 3 * len
-        } else if self.lexicon.is_en_as_typed(&typed.iter().collect::<String>()) && (len >= 4 || evidence) {
+        } else if known && (len >= 4 || evidence) {
             12 + 3 * len
         } else if evidence {
             10 + len
