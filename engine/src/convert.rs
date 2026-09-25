@@ -91,7 +91,9 @@ pub(crate) fn english_surface(word: &str, original: &str) -> String {
 }
 
 /// Best offline segmentation of one run of latin letters (no spaces or punctuation).
-fn segment_chunk(chunk: &str, lexicon: &Lexicon) -> Vec<Segment> {
+/// `sokuon_rule`: read a short word before its own doubled consonant as romaji
+/// (see below); off for the English reading still offered to Jev.
+fn segment_chunk(chunk: &str, lexicon: &Lexicon, sokuon_rule: bool) -> Vec<Segment> {
     if chunk.is_empty() {
         return Vec::new();
     }
@@ -224,7 +226,8 @@ fn segment_chunk(chunk: &str, lexicon: &Lexicon) -> Vec<Segment> {
             // letter: "for|your", "has|expired" stay English. A capital keeps
             // it ("Putto").
             let last = chars[i + len - 1];
-            if len <= 3
+            if sokuon_rule
+                && len <= 3
                 && !typed.starts_with(|c: char| c.is_ascii_uppercase())
                 && !"aiueon".contains(last)
                 && chars.get(i + len) == Some(&last)
@@ -467,6 +470,10 @@ pub(crate) fn push_other(segments: &mut Vec<Segment>, raw: char, surface: char) 
 
 /// Split a raw keystroke buffer into English / Japanese / literal segments.
 pub fn segment_with(raw: &str, lexicon: &Lexicon) -> Vec<Segment> {
+    segment_ruled(raw, lexicon, true)
+}
+
+fn segment_ruled(raw: &str, lexicon: &Lexicon, sokuon_rule: bool) -> Vec<Segment> {
     let mut segments = Vec::new();
     let mut buf = String::new();
 
@@ -475,7 +482,7 @@ pub fn segment_with(raw: &str, lexicon: &Lexicon) -> Vec<Segment> {
             buf.push(ch);
             continue;
         }
-        segments.extend(segment_chunk(&buf, lexicon));
+        segments.extend(segment_chunk(&buf, lexicon, sokuon_rule));
         buf.clear();
         let surface = match ch {
             ',' => '、',
@@ -484,8 +491,16 @@ pub fn segment_with(raw: &str, lexicon: &Lexicon) -> Vec<Segment> {
         };
         push_other(&mut segments, ch, surface);
     }
-    segments.extend(segment_chunk(&buf, lexicon));
+    segments.extend(segment_chunk(&buf, lexicon, sokuon_rule));
     segments
+}
+
+/// Whether `raw` may hold English: offline, or as the English reading the
+/// sokuon rule set aside ("gittoshita"). Worth waiting for Jev on commit.
+pub fn may_be_english(raw: &str, lexicon: &Lexicon) -> bool {
+    [true, false]
+        .iter()
+        .any(|&rule| segment_ruled(raw, lexicon, rule).iter().any(|s| s.kind == SegmentKind::En))
 }
 
 pub fn segment(raw: &str) -> Vec<Segment> {
@@ -758,6 +773,12 @@ pub fn alternatives_with(raw: &str, limit: usize, lexicon: &Lexicon) -> Vec<Vec<
         }
     };
     push(best.clone(), &mut out, &mut seen);
+    // English the sokuon rule read as romaji ("git|to"): offered like the
+    // offline best, so Jev can still pick it.
+    let unruled = merge_adjacent(segment_ruled(raw, lexicon, false));
+    if out.len() < limit && seen.insert(english_mask(&unruled)) {
+        out.push(unruled);
+    }
 
     let all_ja: Vec<Segment> = best
         .iter()
@@ -1100,6 +1121,18 @@ mod tests {
         assert_eq!(shape("gitpullshitara"), vec![en("gitpull"), ja("shitara")]);
         assert_eq!(shape("datatte"), vec![en("data"), ja("tte")]);
         assert_eq!(shape("PRwokittekudasai")[0], en("PR"));
+    }
+
+    #[test]
+    fn english_cut_by_the_sokuon_rule_stays_on_offer() {
+        // Offline these read as Japanese; Jev must still be able to pick the English.
+        for (raw, want) in [("gittoshita", "gitとした"), ("autoputto", "あうとputと")] {
+            let alts: Vec<String> = alternatives(raw, 8).iter().map(|a| render_offline(a)).collect();
+            assert!(alts.contains(&want.to_string()), "{raw}: {alts:?}");
+        }
+        let none = Lexicon::default();
+        assert!(may_be_english("gittoshita", &none));
+        assert!(!may_be_english("sukoshimatte", &none));
     }
 
     #[test]

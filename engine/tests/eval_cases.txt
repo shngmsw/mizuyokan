@@ -109,3 +109,5 @@ honwoyomu
 autoputto
 autoputtoshitai
 puttodasu
+[git]toshita
+[git]to[GitHub]nochigai

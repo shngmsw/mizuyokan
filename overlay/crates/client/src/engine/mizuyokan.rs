@@ -534,7 +534,7 @@ fn remove_lines(path: &Path, words: &[String]) {
 /// Jev is only worth waiting for when the buffer may contain English.
 pub fn looks_mixed(raw: &str) -> bool {
     raw.chars().any(|c| c.is_ascii_uppercase())
-        || Prefetcher::global().segment(raw).iter().any(|s| s.kind == SegmentKind::En)
+        || Prefetcher::global().may_be_english(raw)
 }
 
 /// Called after every keystroke in Kana mode: start judging in the background.
@@ -818,6 +818,8 @@ mod tests {
         assert!(looks_mixed("Google Meetno"));
         assert!(looks_mixed("henshiwaThank"));
         assert!(looks_mixed("gitpullshitara"));
+        // Japanese offline, but Jev may still call it English: wait for it.
+        assert!(looks_mixed("gittoshita"));
     }
 
     /// Talks to the running azooKey server: does it pass full-width letters through?
