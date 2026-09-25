@@ -26,6 +26,9 @@ const MAX_LEARNED: usize = 5000;
 pub const LEARN_AFTER_COMMITS: usize = 2;
 /// Default minimum probability (from Jev) that a word is real before it is learned.
 pub const LEARN_THRESHOLD_DEFAULT: f64 = 0.8;
+/// Escapes to the all-Japanese reading before a word that was not learned
+/// (built in, or picked by Jev) is blocked: one could be a slip.
+pub const BLOCK_AFTER_ESCAPES: usize = 2;
 
 /// Outcome of judging one raw buffer.
 #[derive(Debug, Clone, PartialEq)]
@@ -78,6 +81,10 @@ pub struct Prefetcher {
     rejected: RwLock<HashSet<String>>,
     /// Words due for learning whose check is running (or about to run).
     vetting: Mutex<HashSet<String>>,
+    /// Words the user keeps turning down; never English in lowercase.
+    blocked: RwLock<HashSet<String>>,
+    /// Escapes so far of words not blocked yet.
+    unwanted: Mutex<HashMap<String, usize>>,
 }
 
 /// Probability that a word is a real English word / technical term, or
@@ -97,6 +104,17 @@ pub struct Vetted {
     pub rejected: Vec<String>,
     /// Could not be judged; not learned, and checked again on a later commit.
     pub retry: Vec<String>,
+}
+
+/// Result of [`Prefetcher::disown`]: what to record in files.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Disowned {
+    /// Were learned: take them out of the learned file and record them as rejected.
+    pub forgotten: Vec<String>,
+    /// Escaped often enough: record them as blocked.
+    pub blocked: Vec<String>,
+    /// Escaped, not blocked yet: record one more escape each.
+    pub noted: Vec<String>,
 }
 
 /// Picks one of `options` (rendered texts); `None` when no decision could be made.
@@ -141,6 +159,8 @@ impl Prefetcher {
             sightings: Mutex::new(HashMap::new()),
             rejected: RwLock::new(HashSet::new()),
             vetting: Mutex::new(HashSet::new()),
+            blocked: RwLock::new(HashSet::new()),
+            unwanted: Mutex::new(HashMap::new()),
         }
     }
 
@@ -161,14 +181,15 @@ impl Prefetcher {
         }
     }
 
-    /// `words` without the ones already learned, rejected or being checked.
+    /// `words` without the ones already learned, rejected, blocked or being checked.
     pub fn undecided(&self, words: impl IntoIterator<Item = String>) -> Vec<String> {
         let learned = self.learned();
         let rejected = self.rejected();
+        let blocked = self.blocked();
         let vetting = self.vetting.lock().map(|v| v.clone()).unwrap_or_default();
         words
             .into_iter()
-            .filter(|w| !learned.contains(w) && !rejected.contains(w) && !vetting.contains(w))
+            .filter(|w| !learned.contains(w) && !rejected.contains(w) && !blocked.contains(w) && !vetting.contains(w))
             .collect()
     }
 
@@ -233,9 +254,88 @@ impl Prefetcher {
         self.learned.read().map(|l| l.clone()).unwrap_or_default()
     }
 
+    pub fn blocked(&self) -> HashSet<String> {
+        self.blocked.read().map(|b| b.clone()).unwrap_or_default()
+    }
+
     /// Learned and blocked words as the segmenter sees them.
     pub fn lexicon(&self) -> Lexicon {
-        Lexicon { learned: self.learned(), ..Default::default() }
+        Lexicon { learned: self.learned(), blocked: self.blocked() }
+    }
+
+    /// Replace the learned words with a file's: words removed there (by hand
+    /// or by another process) are forgotten here too.
+    pub fn set_learned(&self, words: impl IntoIterator<Item = String>) {
+        if replace(&self.learned, words) {
+            self.forget_judgements();
+        }
+    }
+
+    /// Replace the blocked words with a file's.
+    pub fn set_blocked(&self, words: impl IntoIterator<Item = String>) {
+        if replace(&self.blocked, words) {
+            self.forget_judgements();
+        }
+    }
+
+    /// Merge escape counts recorded elsewhere; keeps the larger count.
+    pub fn note_unwanted(&self, counts: impl IntoIterator<Item = (String, usize)>) {
+        let Ok(mut unwanted) = self.unwanted.lock() else {
+            return;
+        };
+        for (word, count) in counts {
+            if unwanted.len() >= MAX_LEARNED {
+                break;
+            }
+            let seen = unwanted.entry(word).or_insert(0);
+            *seen = (*seen).max(count);
+        }
+    }
+
+    /// The user went back to the all-Japanese reading of a commit whose
+    /// English `words` they turned down: a learned word is unlearned at once
+    /// (and rejected, so it is not learned again); any other word is blocked
+    /// after [`BLOCK_AFTER_ESCAPES`] escapes.
+    pub fn disown(&self, words: impl IntoIterator<Item = String>) -> Disowned {
+        let blocked = self.blocked();
+        let mut out = Disowned::default();
+        let mut seen = HashSet::new();
+        for word in words {
+            if blocked.contains(&word) || !seen.insert(word.clone()) {
+                continue;
+            }
+            if self.learned.write().map(|mut l| l.remove(&word)).unwrap_or(false) {
+                out.forgotten.push(word);
+                continue;
+            }
+            let Ok(mut unwanted) = self.unwanted.lock() else {
+                continue;
+            };
+            let count = unwanted.entry(word.clone()).or_insert(0);
+            *count += 1;
+            if *count >= BLOCK_AFTER_ESCAPES {
+                unwanted.remove(&word);
+                out.blocked.push(word);
+            } else {
+                out.noted.push(word);
+            }
+        }
+        self.note_rejected(out.forgotten.clone());
+        if let Ok(mut b) = self.blocked.write() {
+            b.extend(out.blocked.iter().cloned());
+        }
+        if !out.forgotten.is_empty() || !out.blocked.is_empty() {
+            self.forget_judgements();
+        }
+        out
+    }
+
+    /// Cached judgements were made with other words; judge again.
+    fn forget_judgements(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.done.clear();
+            state.order.clear();
+        }
     }
 
     /// Add English words (lowercase); returns the ones that were new.
@@ -456,6 +556,17 @@ impl Prefetcher {
         }
         judgement
     }
+}
+
+/// Set `set` to `words` (at most MAX_LEARNED); whether it changed.
+fn replace(set: &RwLock<HashSet<String>>, words: impl IntoIterator<Item = String>) -> bool {
+    let new: HashSet<String> = words.into_iter().take(MAX_LEARNED).collect();
+    let Ok(mut set) = set.write() else {
+        return false;
+    };
+    let changed = *set != new;
+    *set = new;
+    changed
 }
 
 impl Default for Prefetcher {
@@ -731,6 +842,61 @@ mod tests {
         let vetted = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(vetted.learned, vec!["ssh".to_string()]);
         assert!(p.learned().contains("ssh"));
+    }
+
+    #[test]
+    fn escaping_unlearns_learned_words_at_once() {
+        let p = leak();
+        p.remember(["rebiew".to_string()]);
+        let disowned = p.disown(["rebiew".to_string()]);
+        assert_eq!(disowned.forgotten, vec!["rebiew".to_string()]);
+        assert!(!p.learned().contains("rebiew"));
+        assert!(p.rejected().contains("rebiew"));
+        assert!(p.undecided(["rebiew".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn escaping_twice_blocks_other_words() {
+        let p = leak();
+        assert_eq!(p.disown(["put".to_string()]).noted, vec!["put".to_string()]);
+        assert!(p.lexicon().is_en("put"));
+        assert_eq!(p.disown(["put".to_string()]).blocked, vec!["put".to_string()]);
+        assert!(!p.lexicon().is_en("put"));
+        assert!(p.undecided(["put".to_string()]).is_empty());
+        // Already blocked: nothing more to record.
+        assert_eq!(p.disown(["put".to_string()]), Disowned::default());
+    }
+
+    #[test]
+    fn escapes_recorded_elsewhere_count() {
+        let p = leak();
+        p.note_unwanted([("put".to_string(), 1)]);
+        assert_eq!(p.disown(["put".to_string()]).blocked, vec!["put".to_string()]);
+    }
+
+    #[test]
+    fn set_learned_and_set_blocked_replace() {
+        let p = leak();
+        p.remember(["figma".to_string(), "docker".to_string()]);
+        p.set_learned(["figma".to_string()]);
+        assert!(p.learned().contains("figma") && !p.learned().contains("docker"));
+        p.set_blocked(["put".to_string()]);
+        p.set_blocked(Vec::<String>::new());
+        assert!(p.lexicon().is_en("put"));
+    }
+
+    #[test]
+    fn changing_words_drops_cached_judgements() {
+        let p = leak();
+        // Always answers, whatever the options: a failed judgement is not cached.
+        let first: Arc<Judge> = Arc::new(|_: &str, _: &[String]| Some(0));
+        p.judge_now("gitpullshi", first.as_ref());
+        assert!(p.wait("gitpullshi", Duration::ZERO).is_some());
+        p.set_blocked(["pull".to_string()]);
+        assert_eq!(p.wait("gitpullshi", Duration::ZERO), None);
+        p.judge_now("gitpullshi", first.as_ref());
+        p.set_blocked(["pull".to_string()]); // unchanged: the cache stays
+        assert!(p.wait("gitpullshi", Duration::ZERO).is_some());
     }
 
     #[test]
