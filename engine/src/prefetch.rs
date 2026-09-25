@@ -13,10 +13,9 @@ use std::{
 
 use crate::{
     convert::{
-        alternatives_with, as_japanese, concat, cuts_syllable, render_offline, segment_with, Segment,
+        alternatives_with, as_japanese, concat, cuts_syllable, render_offline, segment_with, Lexicon, Segment,
         SegmentKind,
     },
-    dict::{EN_WORDS, PROPER},
     jev::{JevClient, JevConfig},
 };
 
@@ -104,12 +103,12 @@ pub struct Vetted {
 pub type Judge = dyn Fn(&str, &[String]) -> Option<usize> + Send + Sync;
 
 pub fn judge_segments(raw: &str, judge: &Judge) -> Judgement {
-    judge_segments_with(raw, &HashSet::new(), judge)
+    judge_segments_with(raw, &Lexicon::default(), judge)
 }
 
-/// [`judge_segments`] with extra known English words.
-pub fn judge_segments_with(raw: &str, extra_en: &HashSet<String>, judge: &Judge) -> Judgement {
-    let options = alternatives_with(raw, MAX_ALTERNATIVES, extra_en);
+/// [`judge_segments`] with learned and blocked words.
+pub fn judge_segments_with(raw: &str, lexicon: &Lexicon, judge: &Judge) -> Judgement {
+    let options = alternatives_with(raw, MAX_ALTERNATIVES, lexicon);
     if options.len() < 2 {
         return Judgement::Chosen(options.into_iter().next().unwrap_or_default());
     }
@@ -234,6 +233,11 @@ impl Prefetcher {
         self.learned.read().map(|l| l.clone()).unwrap_or_default()
     }
 
+    /// Learned and blocked words as the segmenter sees them.
+    pub fn lexicon(&self) -> Lexicon {
+        Lexicon { learned: self.learned(), ..Default::default() }
+    }
+
     /// Add English words (lowercase); returns the ones that were new.
     pub fn remember(&self, words: impl IntoIterator<Item = String>) -> Vec<String> {
         let Ok(mut learned) = self.learned.write() else {
@@ -301,7 +305,7 @@ impl Prefetcher {
 
     /// Offline segmentation that also knows the learned words.
     pub fn segment(&self, raw: &str) -> Vec<Segment> {
-        segment_with(raw, &self.learned())
+        segment_with(raw, &self.lexicon())
     }
 
     pub fn global() -> &'static Prefetcher {
@@ -322,7 +326,7 @@ impl Prefetcher {
         }
         let raw = raw.to_string();
         std::thread::spawn(move || {
-            let judgement = judge_segments_with(&raw, &self.learned(), judge.as_ref());
+            let judgement = judge_segments_with(&raw, &self.lexicon(), judge.as_ref());
             if let Ok(mut state) = self.state.lock() {
                 match judgement {
                     Judgement::Chosen(segments) => state.store_chosen(raw, segments),
@@ -393,9 +397,7 @@ impl Prefetcher {
             return false;
         }
         let lower = word.to_ascii_lowercase();
-        let known = EN_WORDS.contains(lower.as_str())
-            || PROPER.contains_key(lower.as_str())
-            || self.learned().contains(&lower);
+        let known = self.lexicon().is_en(&lower);
         if known && lower.len() > 3 {
             return false;
         }
@@ -443,7 +445,7 @@ impl Prefetcher {
     /// Judge synchronously (used when nothing was prefetched). Success is cached;
     /// failure is not, so the next call can retry.
     pub fn judge_now(&self, raw: &str, judge: &Judge) -> Judgement {
-        let judgement = judge_segments_with(raw, &self.learned(), judge);
+        let judgement = judge_segments_with(raw, &self.lexicon(), judge);
         if let Ok(mut state) = self.state.lock() {
             match &judgement {
                 Judgement::Chosen(segments) => {
