@@ -826,6 +826,26 @@ pub fn alternatives_with(raw: &str, limit: usize, lexicon: &Lexicon) -> Vec<Vec<
     out
 }
 
+/// Lowercase English words of `segments` that lie wholly within the first
+/// `chars` characters of the buffer (the part being committed).
+pub fn english_words_within(segments: &[Segment], chars: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut end = 0;
+    for s in segments {
+        end += s.raw.chars().count();
+        if s.kind != SegmentKind::En || end > chars {
+            continue;
+        }
+        for word in s.surface.split(' ') {
+            let lower = word.to_ascii_lowercase();
+            if !lower.is_empty() && lower.chars().all(|c| c.is_ascii_lowercase()) && !out.contains(&lower) {
+                out.push(lower);
+            }
+        }
+    }
+    out
+}
+
 /// English words worth remembering from a commit: shown in `committed`, not in
 /// the built-in lexicon, and not readable as romaji ("make" could be まけ, so
 /// learning it would turn Japanese into English later).
@@ -1038,6 +1058,14 @@ mod tests {
             .filter(|s| s.kind == SegmentKind::En)
             .flat_map(|s| s.surface.split(' ').map(str::to_string).collect::<Vec<_>>())
             .collect()
+    }
+
+    #[test]
+    fn english_words_within_counts_only_the_committed_part() {
+        let segments = segment("gitpullshitara"); // [En "git pull"][Ja "shitara"]
+        assert_eq!(english_words_within(&segments, usize::MAX), vec!["git", "pull"]);
+        assert_eq!(english_words_within(&segments, 7), vec!["git", "pull"]);
+        assert!(english_words_within(&segments, 6).is_empty());
     }
 
     #[test]

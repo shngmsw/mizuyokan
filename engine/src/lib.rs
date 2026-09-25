@@ -14,13 +14,13 @@ mod readings;
 mod romaji;
 
 pub use convert::{
-    alternatives, alternatives_with, as_japanese, english_mask, live_convert, render_offline, segment,
-    segment_with, take_committed, words_to_learn, worth_learning, ConvertResult, Lexicon, Segment,
-    SegmentKind,
+    alternatives, alternatives_with, as_japanese, english_mask, english_words_within, live_convert,
+    render_offline, segment, segment_with, take_committed, words_to_learn, worth_learning, ConvertResult,
+    Lexicon, Segment, SegmentKind,
 };
 pub use jev::{JevClient, JevConfig, JevError};
 pub use prefetch::{
-    jev_judge, jev_word_check, judge_segments, judge_segments_with, Judge, Judgement, Prefetcher,
-    Vetted, WordCheck, LEARN_AFTER_COMMITS, LEARN_THRESHOLD_DEFAULT,
+    jev_judge, jev_word_check, judge_segments, judge_segments_with, Disowned, Judge, Judgement, Prefetcher,
+    Vetted, WordCheck, BLOCK_AFTER_ESCAPES, LEARN_AFTER_COMMITS, LEARN_THRESHOLD_DEFAULT,
 };
 pub use romaji::is_commit_punct;
