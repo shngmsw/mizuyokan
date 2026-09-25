@@ -10,8 +10,7 @@
 use std::collections::HashSet;
 
 use crate::{
-    convert::{english_surface, merge_adjacent, push_other, Segment, SegmentKind},
-    dict::{EN_WORDS, PROPER},
+    convert::{english_surface, merge_adjacent, push_other, Lexicon, Segment, SegmentKind},
     romaji::{hard_leftovers, map_commit_punct, scan, to_ime_kana},
 };
 
@@ -57,7 +56,7 @@ struct Chunk<'a> {
     lower: Vec<char>,
     /// Letters that cannot be read as romaji in the context of the whole run.
     leftover: Vec<bool>,
-    extra_en: &'a HashSet<String>,
+    lexicon: &'a Lexicon,
 }
 
 impl Chunk<'_> {
@@ -66,7 +65,7 @@ impl Chunk<'_> {
     }
 
     fn known(&self, word: &str) -> bool {
-        EN_WORDS.contains(word) || PROPER.contains_key(word) || self.extra_en.contains(word)
+        self.lexicon.is_en(word)
     }
 
     /// A letter in `i..j` that is not romaji, in the context of the whole run
@@ -83,11 +82,14 @@ impl Chunk<'_> {
         }
         let word = self.word(i, j);
         let typed = &self.original[i..j];
+        if self.lexicon.blocked.contains(&word) && !typed[0].is_ascii_uppercase() {
+            return None;
+        }
         let evidence = self.evidence(i, j);
         let mut score = PIECE_COST;
-        score += if self.extra_en.contains(&word) {
+        score += if self.lexicon.is_learned(&word) {
             20 + 3 * len
-        } else if self.known(&word) && (len >= 4 || evidence) {
+        } else if self.lexicon.is_en_as_typed(&typed.iter().collect::<String>()) && (len >= 4 || evidence) {
             12 + 3 * len
         } else if evidence {
             10 + len
@@ -214,7 +216,7 @@ fn push(beam: &mut Vec<Path>, from: &Path, kind: Piece, i: usize, j: usize, sc: 
     }
 }
 
-fn chunk_readings(chunk: &str, extra_en: &HashSet<String>, k: usize) -> Vec<(i32, Vec<Segment>)> {
+fn chunk_readings(chunk: &str, lexicon: &Lexicon, k: usize) -> Vec<(i32, Vec<Segment>)> {
     let original: Vec<char> = chunk.chars().collect();
     let lower: Vec<char> = chunk.to_lowercase().chars().collect();
     let mut leftover = vec![false; lower.len()];
@@ -225,7 +227,7 @@ fn chunk_readings(chunk: &str, extra_en: &HashSet<String>, k: usize) -> Vec<(i32
         original,
         lower,
         leftover,
-        extra_en,
+        lexicon,
     };
     c.best_paths(k)
         .iter()
@@ -240,14 +242,14 @@ enum Item {
 
 /// Up to `limit` readings of `raw`, best first. Letter runs that have no
 /// reading at all (only possible for unreadable leftovers) are kept as typed.
-pub(crate) fn readings(raw: &str, extra_en: &HashSet<String>, limit: usize) -> Vec<Vec<Segment>> {
+pub(crate) fn readings(raw: &str, lexicon: &Lexicon, limit: usize) -> Vec<Vec<Segment>> {
     let mut items = Vec::new();
     let mut buf = String::new();
     let flush = |buf: &mut String, items: &mut Vec<Item>| {
         if buf.is_empty() {
             return;
         }
-        let mut found = chunk_readings(buf, extra_en, limit);
+        let mut found = chunk_readings(buf, lexicon, limit);
         if found.is_empty() {
             found.push((
                 0,
@@ -312,7 +314,7 @@ mod tests {
     use crate::convert::render_offline;
 
     fn rendered(raw: &str) -> Vec<String> {
-        readings(raw, &HashSet::new(), 8)
+        readings(raw, &Lexicon::default(), 8)
             .iter()
             .map(|r| render_offline(r))
             .collect()
@@ -333,7 +335,7 @@ mod tests {
 
     #[test]
     fn learned_words_win() {
-        let learned: HashSet<String> = ["figma".to_string()].into();
+        let learned = Lexicon { learned: ["figma".to_string()].into(), ..Default::default() };
         let top = readings("Figmanodezain", &learned, 8);
         assert!(render_offline(&top[0]).starts_with("Figmaのでざい"), "{top:?}");
     }

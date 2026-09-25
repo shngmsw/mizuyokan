@@ -26,6 +26,39 @@ pub struct Segment {
     pub surface: String,
 }
 
+/// Words the segmenter knows beyond the built-in lexicon, and words the user
+/// turned down (built in or learned).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Lexicon {
+    /// Learned from commits (mizuyokan_words.txt); weighted above the built-in lexicon.
+    pub learned: HashSet<String>,
+    /// Never English when typed in lowercase (mizuyokan_words_blocked.txt).
+    pub blocked: HashSet<String>,
+}
+
+impl Lexicon {
+    /// `word` (lowercase) is an English word here.
+    pub fn is_en(&self, word: &str) -> bool {
+        !self.blocked.contains(word)
+            && (EN_WORDS.contains(word) || PROPER.contains_key(word) || self.learned.contains(word))
+    }
+
+    /// Like [`Self::is_en`] for a word as typed: starting with a capital, a
+    /// blocked word is still English ("Pull").
+    pub fn is_en_as_typed(&self, typed: &str) -> bool {
+        let word = typed.to_ascii_lowercase();
+        if typed.starts_with(|c: char| c.is_ascii_uppercase()) {
+            EN_WORDS.contains(word.as_str()) || PROPER.contains_key(word.as_str()) || self.learned.contains(&word)
+        } else {
+            self.is_en(&word)
+        }
+    }
+
+    pub fn is_learned(&self, word: &str) -> bool {
+        self.learned.contains(word) && !self.blocked.contains(word)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     En,
@@ -58,7 +91,7 @@ pub(crate) fn english_surface(word: &str, original: &str) -> String {
 }
 
 /// Best offline segmentation of one run of latin letters (no spaces or punctuation).
-fn segment_chunk(chunk: &str, extra_en: &HashSet<String>) -> Vec<Segment> {
+fn segment_chunk(chunk: &str, lexicon: &Lexicon) -> Vec<Segment> {
     if chunk.is_empty() {
         return Vec::new();
     }
@@ -69,9 +102,7 @@ fn segment_chunk(chunk: &str, extra_en: &HashSet<String>) -> Vec<Segment> {
     let mut choice: Vec<Option<Choice>> = vec![None; n + 1];
     score[0] = 0;
 
-    let is_en = |word: &str| -> bool {
-        EN_WORDS.contains(word) || PROPER.contains_key(word) || extra_en.contains(word)
-    };
+    let is_en = |word: &str| -> bool { lexicon.is_en(word) };
     // Letters that cannot be read as romaji mark words outside the lexicon
     // ("kubernetes", "deploy") as likely English. A guess covers one leftover
     // cluster (leftovers with only a few letters between them), extended back
@@ -170,7 +201,8 @@ fn segment_chunk(chunk: &str, extra_en: &HashSet<String>) -> Vec<Segment> {
             if !word.chars().all(|c| c.is_ascii_lowercase()) {
                 continue;
             }
-            let known = is_en(&word);
+            let typed: String = original[i..i + len].iter().collect();
+            let known = lexicon.is_en_as_typed(&typed);
             if !known {
                 // Only the full leftover-containing run, never a substring or a
                 // neighbor of a known English word (which would insert a space).
@@ -182,8 +214,11 @@ fn segment_chunk(chunk: &str, extra_en: &HashSet<String>) -> Vec<Segment> {
                     continue;
                 }
             }
-            let typed: String = original[i..i + len].iter().collect();
             let acronym = typed.chars().all(|c| c.is_ascii_uppercase());
+            // Turned down by the user; a capital still makes it English ("Pull").
+            if lexicon.blocked.contains(&word) && !typed.starts_with(|c: char| c.is_ascii_uppercase()) {
+                continue;
+            }
             // "auto|put|to": a short word whose closing consonant is doubled
             // into the next kana (っと) is romaji, not English. Only a doubled
             // letter: "for|your", "has|expired" stay English. A capital keeps
@@ -210,7 +245,7 @@ fn segment_chunk(chunk: &str, extra_en: &HashSet<String>) -> Vec<Segment> {
             let ambiguous_stem = known
                 && !acronym
                 && !PROPER.contains_key(word.as_str())
-                && !extra_en.contains(&word)
+                && !lexicon.is_learned(&word)
                 && !matches!(prev_kind, Some(Kind::En))
                 && word_hard.iter().all(|&p| p + 2 >= len);
             // Fully readable after Japanese ("sakkiitta|you|ni" = ように): Japanese.
@@ -237,7 +272,7 @@ fn segment_chunk(chunk: &str, extra_en: &HashSet<String>) -> Vec<Segment> {
                 // Prefer the full run over any Japanese reading of the same letters.
                 80 + (len as i32) * 20
             };
-            if PROPER.contains_key(word.as_str()) || extra_en.contains(&word) {
+            if lexicon.is_learned(&word) || (known && PROPER.contains_key(word.as_str())) {
                 sc += 55;
             }
             if typed.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
@@ -326,7 +361,7 @@ fn segment_chunk(chunk: &str, extra_en: &HashSet<String>) -> Vec<Segment> {
             }
             let en_progress = rest.len() >= 2
                 && (EN_WORDS.iter().any(|w| w.starts_with(&rest))
-                    || extra_en.iter().any(|w| w.starts_with(&rest)))
+                    || lexicon.learned.iter().any(|w| w.starts_with(&rest)))
                 && !is_en(&rest)
                 && particle_from_romaji(&rest).is_none();
             let sc = if en_progress {
@@ -431,7 +466,7 @@ pub(crate) fn push_other(segments: &mut Vec<Segment>, raw: char, surface: char) 
 }
 
 /// Split a raw keystroke buffer into English / Japanese / literal segments.
-pub fn segment_with(raw: &str, extra_en: &HashSet<String>) -> Vec<Segment> {
+pub fn segment_with(raw: &str, lexicon: &Lexicon) -> Vec<Segment> {
     let mut segments = Vec::new();
     let mut buf = String::new();
 
@@ -440,7 +475,7 @@ pub fn segment_with(raw: &str, extra_en: &HashSet<String>) -> Vec<Segment> {
             buf.push(ch);
             continue;
         }
-        segments.extend(segment_chunk(&buf, extra_en));
+        segments.extend(segment_chunk(&buf, lexicon));
         buf.clear();
         let surface = match ch {
             ',' => '、',
@@ -449,12 +484,12 @@ pub fn segment_with(raw: &str, extra_en: &HashSet<String>) -> Vec<Segment> {
         };
         push_other(&mut segments, ch, surface);
     }
-    segments.extend(segment_chunk(&buf, extra_en));
+    segments.extend(segment_chunk(&buf, lexicon));
     segments
 }
 
 pub fn segment(raw: &str) -> Vec<Segment> {
-    segment_with(raw, &HashSet::new())
+    segment_with(raw, &Lexicon::default())
 }
 
 pub fn render_offline(segments: &[Segment]) -> String {
@@ -540,8 +575,8 @@ pub fn english_mask(segments: &[Segment]) -> Vec<bool> {
 /// Whether a person could have meant this reading. Jev is easily swayed by
 /// options no one would type ("てstがとおらない", "issueをたてmasu"), so
 /// those are not offered.
-fn plausible(cand: &[Segment], extra_en: &HashSet<String>) -> bool {
-    let known = |w: &str| EN_WORDS.contains(w) || PROPER.contains_key(w) || extra_en.contains(w);
+fn plausible(cand: &[Segment], lexicon: &Lexicon) -> bool {
+    let known = |w: &str| lexicon.is_en(w);
     // Fine as romaji; a final n is ん still being typed ("hen").
     let readable = |w: &str| {
         let left = crate::romaji::scan(w).1;
@@ -613,6 +648,9 @@ fn plausible(cand: &[Segment], extra_en: &HashSet<String>) -> bool {
                 }
                 for word in seg.surface.split(' ').filter(|w| w.is_ascii()) {
                     let w = word.to_ascii_lowercase();
+                    if lexicon.blocked.contains(&w) && !word.starts_with(|c: char| c.is_ascii_uppercase()) {
+                        return false;
+                    }
                     if !known(&w) && swallows_particle(word, &known) {
                         return false;
                     }
@@ -701,18 +739,18 @@ fn swallows_particle(word: &str, known: &dyn Fn(&str) -> bool) -> bool {
 /// Plausible readings of the buffer for a judge (Jev) to choose from.
 /// The offline best is always first, the all-Japanese reading second.
 pub fn alternatives(raw: &str, limit: usize) -> Vec<Vec<Segment>> {
-    alternatives_with(raw, limit, &HashSet::new())
+    alternatives_with(raw, limit, &Lexicon::default())
 }
 
-/// [`alternatives`] with extra known English words (learned from past commits).
-pub fn alternatives_with(raw: &str, limit: usize, extra_en: &HashSet<String>) -> Vec<Vec<Segment>> {
-    let best = segment_with(raw, extra_en);
+/// [`alternatives`] with learned and blocked words.
+pub fn alternatives_with(raw: &str, limit: usize, lexicon: &Lexicon) -> Vec<Vec<Segment>> {
+    let best = segment_with(raw, lexicon);
     let mut out: Vec<Vec<Segment>> = Vec::new();
     let mut seen: HashSet<Vec<bool>> = HashSet::new();
     let push = |cand: Vec<Segment>, out: &mut Vec<Vec<Segment>>, seen: &mut HashSet<Vec<bool>>| {
         let cand = merge_adjacent(cand);
         // The offline best is always offered, even when it looks odd.
-        if !out.is_empty() && !plausible(&cand, extra_en) {
+        if !out.is_empty() && !plausible(&cand, lexicon) {
             return;
         }
         if out.len() < limit && seen.insert(english_mask(&cand)) {
@@ -733,7 +771,7 @@ pub fn alternatives_with(raw: &str, limit: usize, extra_en: &HashSet<String>) ->
         .collect();
     push(all_ja, &mut out, &mut seen);
 
-    for cand in crate::readings::readings(raw, extra_en, limit) {
+    for cand in crate::readings::readings(raw, lexicon, limit) {
         push(cand, &mut out, &mut seen);
     }
 
@@ -994,6 +1032,32 @@ mod tests {
         assert_eq!(live_convert("xtukoshi").surface, "っこし");
     }
 
+    fn words_of(segments: &[Segment]) -> Vec<String> {
+        segments
+            .iter()
+            .filter(|s| s.kind == SegmentKind::En)
+            .flat_map(|s| s.surface.split(' ').map(str::to_string).collect::<Vec<_>>())
+            .collect()
+    }
+
+    #[test]
+    fn blocked_words_are_not_english() {
+        let lexicon = Lexicon { blocked: ["pull".to_string()].into(), ..Default::default() };
+        assert!(!lexicon.is_en("pull"));
+        assert!(lexicon.is_en("git"));
+        assert!(!words_of(&segment_with("gitpullshitara", &lexicon)).contains(&"pull".to_string()));
+        for alt in alternatives_with("gitpullshitara", 8, &lexicon) {
+            assert!(!words_of(&alt).contains(&"pull".to_string()), "{}", render_offline(&alt));
+        }
+        // Typed with a capital, it is still on offer.
+        assert!(alternatives_with("Pullshitara", 8, &lexicon)
+            .iter()
+            .any(|a| a[0].kind == SegmentKind::En && a[0].raw == "Pull"));
+        // Learned and blocked: blocked wins.
+        let both = Lexicon { learned: ["rebiew".to_string()].into(), blocked: ["rebiew".to_string()].into() };
+        assert!(!both.is_en("rebiew") && !both.is_learned("rebiew"));
+    }
+
     #[test]
     fn short_word_before_its_own_sokuon_is_japanese() {
         for raw in ["autoputto", "autoputtoshita", "puttodasu"] {
@@ -1081,7 +1145,7 @@ mod tests {
 
     #[test]
     fn junk_readings_are_not_offered() {
-        let none = HashSet::new();
+        let none = Lexicon::default();
         let en = |raw: &str, surface: &str| Segment { kind: SegmentKind::En, raw: raw.into(), surface: surface.into() };
         let ja = |raw: &str| Segment { kind: SegmentKind::Ja, raw: raw.into(), surface: to_ime_kana(raw, false) };
         assert!(!plausible(&[en("Meetno", "Meet no")], &none));
