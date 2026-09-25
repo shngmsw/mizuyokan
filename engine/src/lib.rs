@@ -15,8 +15,8 @@ mod romaji;
 
 pub use convert::{
     alternatives, alternatives_with, as_japanese, english_mask, english_words_within, live_convert,
-    render_offline, segment, segment_with, take_committed, words_to_learn, worth_learning, ConvertResult,
-    Lexicon, Segment, SegmentKind,
+    may_be_english, render_offline, segment, segment_with, take_committed, words_to_learn,
+    worth_learning, ConvertResult, Lexicon, Segment, SegmentKind,
 };
 pub use jev::{JevClient, JevConfig, JevError};
 pub use prefetch::{

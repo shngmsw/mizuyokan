@@ -13,8 +13,8 @@ use std::{
 
 use crate::{
     convert::{
-        alternatives_with, as_japanese, concat, cuts_syllable, render_offline, segment_with, Lexicon, Segment,
-        SegmentKind,
+        alternatives_with, as_japanese, concat, cuts_syllable, may_be_english, render_offline, segment_with,
+        Lexicon, Segment, SegmentKind,
     },
     jev::{JevClient, JevConfig},
 };
@@ -401,6 +401,11 @@ impl Prefetcher {
             let seen = sightings.entry(word).or_insert(0);
             *seen = (*seen).max(count);
         }
+    }
+
+    /// [`may_be_english`] with the learned and blocked words.
+    pub fn may_be_english(&self, raw: &str) -> bool {
+        may_be_english(raw, &self.lexicon())
     }
 
     /// Offline segmentation that also knows the learned words.
