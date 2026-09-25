@@ -134,8 +134,8 @@ fn offline_and_options() {
     japanese_prefixes.report("japanese never offered as english while typing");
 
     // Regression floors: raise them when the numbers improve.
-    assert!(offline.hit >= 59, "offline accuracy dropped");
-    assert!(options.hit >= 88, "option coverage dropped");
+    assert!(offline.hit >= 62, "offline accuracy dropped");
+    assert!(options.hit >= 91, "option coverage dropped");
     // Misses left: get/set/ok (known short words, still Jev's call) and "purogurammi".
     assert!(japanese_prefixes.hit >= 33, "English offered for Japanese being typed");
     // "purogurammingu": mm is not read as っ on purpose (see romaji.rs), so

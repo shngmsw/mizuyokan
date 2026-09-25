@@ -104,3 +104,8 @@ honwoyomu
 [Slack]dezuttomatteta
 [PR]wokittekudasai
 [Figma]demottoyokusuru
+
+# a short English word whose closing consonant is a small tsu: Japanese
+autoputto
+autoputtoshitai
+puttodasu

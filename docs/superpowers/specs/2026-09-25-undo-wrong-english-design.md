@@ -24,7 +24,7 @@
 ## 1. put 系のバグ修正（engine）
 
 - `merge_adjacent`: `Ja` 同士を結合するときは、結合後の `raw` から romaji → かなを作り直して `surface` にする（`flip` と同じ変換を使う）。`En` 同士の結合は今のまま（空白で連結）。
-- 区切りをまたぐ促音: 3文字以下の英単語の最後の子音が、直後のローマ字とつながってかなになる場合（`put|to`、`get|ta` など。判定は既存の `cuts_syllable`）は、`segment_chunk` の最良分割で英語として読まない。組み込み語であっても日本語側を優先する。ただし大文字で始まる語（`Put`）は対象外。4文字以上の語（`commit|to` など）は今までどおり英語のまま。Jev の選択肢（`plausible`）は既に同じ規則で絞っているので、`readings` は変えない。
+- 区切りをまたぐ促音: 3文字以下の英単語の最後の子音（n 以外）が直後で重なり、その後に母音か y が続く場合（`put|to`、`get|ta` など。っ になる）は、`segment_chunk` の最良分割で英語として読まない。`cuts_syllable` 全般に広げると `for|your`（りょ）や `has|expired`（せ）まで壊れるので、重なった子音に限る。組み込み語であっても日本語側を優先する。ただし大文字で始まる語（`Put`）は対象外。4文字以上の語（`commit|to` など）は今までどおり英語のまま。Jev の選択肢（`plausible`）は既に同じ規則で絞っているので、`readings` は変えない。
 - eval（`engine/tests/eval_cases.txt`）に `autoputto`、`autoputtoshita`、`sutoppu` 系などを追加する。既存ケースの正答率が下がらないことを確認する。
 
 ## 2. 変換中の逃げ道（client）

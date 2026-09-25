@@ -184,6 +184,19 @@ fn segment_chunk(chunk: &str, extra_en: &HashSet<String>) -> Vec<Segment> {
             }
             let typed: String = original[i..i + len].iter().collect();
             let acronym = typed.chars().all(|c| c.is_ascii_uppercase());
+            // "auto|put|to": a short word whose closing consonant is doubled
+            // into the next kana (っと) is romaji, not English. Only a doubled
+            // letter: "for|your", "has|expired" stay English. A capital keeps
+            // it ("Putto").
+            let last = chars[i + len - 1];
+            if len <= 3
+                && !typed.starts_with(|c: char| c.is_ascii_uppercase())
+                && !"aiueon".contains(last)
+                && chars.get(i + len) == Some(&last)
+                && chars.get(i + len + 1).is_some_and(|c| "aiueoy".contains(*c))
+            {
+                continue;
+            }
             if PARTICLE_PREFERRED.contains(&word.as_str()) && !acronym {
                 continue;
             }
@@ -979,6 +992,22 @@ mod tests {
         assert_eq!(live_convert("kotchi").surface, "こっち");
         assert_eq!(live_convert("mecchakucha").surface, "めっちゃくちゃ");
         assert_eq!(live_convert("xtukoshi").surface, "っこし");
+    }
+
+    #[test]
+    fn short_word_before_its_own_sokuon_is_japanese() {
+        for raw in ["autoputto", "autoputtoshita", "puttodasu"] {
+            assert!(
+                segment(raw).iter().all(|s| s.kind != SegmentKind::En),
+                "{raw}: {:?}",
+                segment(raw)
+            );
+        }
+        assert_eq!(live_convert("autoputto").surface, "あうとぷっと");
+        // Longer words and capitals keep English.
+        assert_eq!(shape("gitpullshitara"), vec![en("gitpull"), ja("shitara")]);
+        assert_eq!(shape("datatte"), vec![en("data"), ja("tte")]);
+        assert_eq!(shape("PRwokittekudasai")[0], en("PR"));
     }
 
     #[test]
