@@ -54,6 +54,16 @@ impl Lexicon {
         }
     }
 
+    /// An unknown word, as typed, that holds a blocked word in lowercase
+    /// ("reviewsh" with "review" blocked): not English either.
+    pub fn hides_blocked(&self, typed: &str) -> bool {
+        if typed.starts_with(|c: char| c.is_ascii_uppercase()) {
+            return false;
+        }
+        let word = typed.to_ascii_lowercase();
+        self.blocked.iter().any(|b| word.contains(b.as_str()))
+    }
+
     pub fn is_learned(&self, word: &str) -> bool {
         self.learned.contains(word) && !self.blocked.contains(word)
     }
@@ -217,8 +227,9 @@ fn segment_chunk(chunk: &str, lexicon: &Lexicon, sokuon_rule: bool) -> Vec<Segme
                 }
             }
             let acronym = typed.chars().all(|c| c.is_ascii_uppercase());
-            // Turned down by the user; a capital still makes it English ("Pull").
-            if lexicon.blocked.contains(&word) && !typed.starts_with(|c: char| c.is_ascii_uppercase()) {
+            // Turned down by the user, alone or inside a guess ("reviewsh"); a
+            // capital still makes it English ("Pull").
+            if !known && lexicon.hides_blocked(&typed) {
                 continue;
             }
             // "auto|put|to": a short word whose closing consonant is doubled
@@ -663,7 +674,7 @@ fn plausible(cand: &[Segment], lexicon: &Lexicon) -> bool {
                 }
                 for word in seg.surface.split(' ').filter(|w| w.is_ascii()) {
                     let w = word.to_ascii_lowercase();
-                    if lexicon.blocked.contains(&w) && !word.starts_with(|c: char| c.is_ascii_uppercase()) {
+                    if !known(&w) && lexicon.hides_blocked(word) {
                         return false;
                     }
                     if !known(&w) && swallows_particle(word, &known) {
@@ -1105,6 +1116,22 @@ mod tests {
         // Learned and blocked: blocked wins.
         let both = Lexicon { learned: ["rebiew".to_string()].into(), blocked: ["rebiew".to_string()].into() };
         assert!(!both.is_en("rebiew") && !both.is_learned("rebiew"));
+    }
+
+    #[test]
+    fn blocked_words_do_not_come_back_as_unknown_english() {
+        for (raw, word) in [("reviewshite", "review"), ("testwokaku", "test"), ("deployshita", "deploy"), ("gitpullshitara", "pull")] {
+            let lexicon = Lexicon { blocked: [word.to_string()].into(), ..Default::default() };
+            let mut all = vec![segment_with(raw, &lexicon)];
+            all.extend(alternatives_with(raw, 8, &lexicon));
+            for reading in all {
+                assert!(
+                    !words_of(&reading).iter().any(|w| w.to_ascii_lowercase().contains(word)),
+                    "{word} blocked, {raw}: {}",
+                    render_offline(&reading)
+                );
+            }
+        }
     }
 
     #[test]
