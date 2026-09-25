@@ -24,7 +24,7 @@
 ## 1. put 系のバグ修正（engine）
 
 - `merge_adjacent`: `Ja` 同士を結合するときは、結合後の `raw` から romaji → かなを作り直して `surface` にする（`flip` と同じ変換を使う）。`En` 同士の結合は今のまま（空白で連結）。
-- 区切りをまたぐ促音: 英単語の最後の子音と、直後の `Ja` 区切りの先頭子音が同じで、その後に母音が続く場合（`put|to`、`get|ta` など）は、英語として読む分割を採用しない。対象は `segment_chunk` の最良分割と `readings` のスコアの両方。組み込み語であっても日本語側を優先する。ただし大文字で始まる語（`Put`）は対象外。
+- 区切りをまたぐ促音: 3文字以下の英単語の最後の子音が、直後のローマ字とつながってかなになる場合（`put|to`、`get|ta` など。判定は既存の `cuts_syllable`）は、`segment_chunk` の最良分割で英語として読まない。組み込み語であっても日本語側を優先する。ただし大文字で始まる語（`Put`）は対象外。4文字以上の語（`commit|to` など）は今までどおり英語のまま。Jev の選択肢（`plausible`）は既に同じ規則で絞っているので、`readings` は変えない。
 - eval（`engine/tests/eval_cases.txt`）に `autoputto`、`autoputtoshita`、`sutoppu` 系などを追加する。既存ケースの正答率が下がらないことを確認する。
 
 ## 2. 変換中の逃げ道（client）
@@ -47,9 +47,9 @@
   - `Prefetcher::forget(words)` で学習語の集合から外す。
 - **それ以外**（組み込み語、Jev が選んだ未知語）: 1回目は `mizuyokan_words_unwanted.txt` に1行追記して数える（候補ファイルと同じく1行1回）。2回目で `mizuyokan_words_blocked.txt` に移し、以後は英語扱いしない。
   - ブロックした語は `EN_WORDS`、`PROPER`、学習語より優先して「英語ではない」とする。対象は `segment_chunk`、`plausible`、`readings`。
-  - 大文字で始まる語は、ブロックした語でも英語として扱う（逃げ道として残す）。
+  - 大文字で始まる語は、ブロックした語でも Jev の選択肢に残す（逃げ道として残す）。大文字の区切りを英語にする既存の選択肢（`alternatives_with` の cased）がそのまま使われる。
   - 学習の対象（`words_to_learn` → `undecided`）からも外す。
-- 学習語の集合、ブロックした語の集合、却下した語の集合のどれかが変わったら、`Prefetcher` の判定キャッシュ（`State.done`）を消す。
+- 学習語の集合かブロックした語の集合が変わったら、`Prefetcher` の判定キャッシュ（`State.done`）を消す（却下した語は分割に影響しないので対象外）。
 
 ### engine 側のインターフェース
 
