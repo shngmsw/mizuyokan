@@ -7,15 +7,15 @@
 //! Without an API key nothing here runs and the IME is plain azooKey.
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{LazyLock, Mutex},
     time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::Result;
 use mizuyokan_engine::{
-    jev_judge, jev_word_check, words_to_learn, JevConfig, Judgement, Prefetcher, Segment,
-    SegmentKind, Vetted, LEARN_THRESHOLD_DEFAULT,
+    as_japanese, english_words_within, jev_judge, jev_word_check, render_offline, words_to_learn,
+    Disowned, JevConfig, Judgement, Prefetcher, Segment, SegmentKind, Vetted, LEARN_THRESHOLD_DEFAULT,
 };
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +34,11 @@ const CANDIDATES_FILENAME: &str = "mizuyokan_word_candidates.txt";
 /// Words Jev judged not to be real English, one per line: never learned and
 /// never asked about again. Checks that failed are not written here.
 const REJECTED_FILENAME: &str = "mizuyokan_words_rejected.txt";
+/// Words turned down by going back to the all-Japanese reading often
+/// enough, one per line: never English when typed in lowercase.
+const BLOCKED_FILENAME: &str = "mizuyokan_words_blocked.txt";
+/// Such escapes of words not blocked yet, one line per escape.
+const UNWANTED_FILENAME: &str = "mizuyokan_words_unwanted.txt";
 /// Past this many lines the candidates file is started over.
 const MAX_CANDIDATE_LINES: usize = 2000;
 /// Defaults match karukan's idea of adaptive degrade: a few bad calls and we
@@ -341,6 +346,14 @@ fn rejected_path() -> Option<PathBuf> {
     Settings::path().map(|p| p.with_file_name(REJECTED_FILENAME))
 }
 
+fn blocked_path() -> Option<PathBuf> {
+    Settings::path().map(|p| p.with_file_name(BLOCKED_FILENAME))
+}
+
+fn unwanted_path() -> Option<PathBuf> {
+    Settings::path().map(|p| p.with_file_name(UNWANTED_FILENAME))
+}
+
 /// The file's text when it changed since the last call for the same `seen` (by mtime).
 fn read_if_changed(path: Option<PathBuf>, seen: &Mutex<Option<SystemTime>>) -> Option<String> {
     let path = path?;
@@ -359,26 +372,40 @@ fn file_words(text: &str) -> impl Iterator<Item = String> + '_ {
         .filter(|w| !w.is_empty())
 }
 
-/// Pull in words (and commit counts) other processes recorded since the last look.
-/// Learned words are taken as they are, without today's `words_to_learn` rules.
+/// Pull in word lists (and counts) other processes, or the user, changed
+/// since the last look. Learned and blocked words replace what is in memory,
+/// so lines deleted from those files are forgotten. Learned words are taken
+/// as they are, without today's `words_to_learn` rules.
 fn load_learned() {
     static WORDS_SEEN: LazyLock<Mutex<Option<SystemTime>>> = LazyLock::new(|| Mutex::new(None));
     static CANDIDATES_SEEN: LazyLock<Mutex<Option<SystemTime>>> =
         LazyLock::new(|| Mutex::new(None));
     static REJECTED_SEEN: LazyLock<Mutex<Option<SystemTime>>> = LazyLock::new(|| Mutex::new(None));
+    static BLOCKED_SEEN: LazyLock<Mutex<Option<SystemTime>>> = LazyLock::new(|| Mutex::new(None));
+    static UNWANTED_SEEN: LazyLock<Mutex<Option<SystemTime>>> = LazyLock::new(|| Mutex::new(None));
     if let Some(text) = read_if_changed(words_path(), &WORDS_SEEN) {
-        Prefetcher::global().remember(file_words(&text));
+        Prefetcher::global().set_learned(file_words(&text));
+    }
+    if let Some(text) = read_if_changed(blocked_path(), &BLOCKED_SEEN) {
+        Prefetcher::global().set_blocked(file_words(&text));
     }
     if let Some(text) = read_if_changed(rejected_path(), &REJECTED_SEEN) {
         Prefetcher::global().note_rejected(file_words(&text));
     }
     if let Some(text) = read_if_changed(candidates_path(), &CANDIDATES_SEEN) {
-        let mut counts = std::collections::HashMap::<String, usize>::new();
-        for word in file_words(&text) {
-            *counts.entry(word).or_default() += 1;
-        }
-        Prefetcher::global().note_sightings(counts);
+        Prefetcher::global().note_sightings(line_counts(&text));
     }
+    if let Some(text) = read_if_changed(unwanted_path(), &UNWANTED_SEEN) {
+        Prefetcher::global().note_unwanted(line_counts(&text));
+    }
+}
+
+fn line_counts(text: &str) -> std::collections::HashMap<String, usize> {
+    let mut counts = std::collections::HashMap::<String, usize>::new();
+    for word in file_words(text) {
+        *counts.entry(word).or_default() += 1;
+    }
+    counts
 }
 
 fn append_lines(path: Option<PathBuf>, words: &[String]) {
@@ -455,6 +482,53 @@ fn record_vetted(vetted: Vetted) {
     if !vetted.retry.is_empty() {
         debug_log!("word check failed: not learning {:?} yet", vetted.retry);
     }
+}
+
+/// The user went back to the all-Japanese reading and committed it: unlearn
+/// or block the English words of the reading they turned down, within the
+/// first `committed_chars` characters of the buffer.
+pub fn unlearn(turned_down: &[Segment], committed_chars: usize) {
+    if !loaded().learn_words {
+        return;
+    }
+    let words = english_words_within(turned_down, committed_chars);
+    if words.is_empty() {
+        return;
+    }
+    load_learned();
+    let disowned = Prefetcher::global().disown(words);
+    debug_log!("turned down {disowned:?}");
+    if let Some(dir) = Settings::path().as_deref().and_then(Path::parent) {
+        record_disowned(dir, &disowned);
+    }
+}
+
+/// Write the outcome of `Prefetcher::disown` into the word files in `dir`.
+fn record_disowned(dir: &Path, disowned: &Disowned) {
+    if !disowned.forgotten.is_empty() {
+        remove_lines(&dir.join(WORDS_FILENAME), &disowned.forgotten);
+        append_lines(Some(dir.join(REJECTED_FILENAME)), &disowned.forgotten);
+    }
+    if !disowned.blocked.is_empty() {
+        append_lines(Some(dir.join(BLOCKED_FILENAME)), &disowned.blocked);
+        remove_lines(&dir.join(UNWANTED_FILENAME), &disowned.blocked);
+    }
+    if !disowned.noted.is_empty() {
+        append_lines(Some(dir.join(UNWANTED_FILENAME)), &disowned.noted);
+    }
+}
+
+/// Drop the lines holding any of `words` (case-insensitive) from a word file.
+fn remove_lines(path: &Path, words: &[String]) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let kept: String = text
+        .lines()
+        .filter(|l| !words.contains(&l.trim().to_ascii_lowercase()))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let _ = std::fs::write(path, kept);
 }
 
 /// Jev is only worth waiting for when the buffer may contain English.
@@ -617,6 +691,29 @@ pub fn sync(
     }
 }
 
+/// Feed `raw` again by hand: with `segments` (English spans) or plain. For
+/// switching between the mixed and the all-Japanese reading; `None` when the
+/// IPC call failed and azooKey was left as it was.
+pub fn refeed(raw: &str, segments: Option<&[Segment]>, ipc: &mut IPCService) -> Option<Candidates> {
+    match feed_azookey(ipc, raw, segments) {
+        Ok(candidates) => Some(candidates),
+        Err(e) => {
+            debug_log!("refeed {raw:?} failed ({e:?})");
+            None
+        }
+    }
+}
+
+pub fn has_english(segments: Option<&[Segment]>) -> bool {
+    segments.is_some_and(|s| s.iter().any(|s| s.kind == SegmentKind::En))
+}
+
+/// The whole buffer as hiragana (F6 while English spans are fed as letters,
+/// where azooKey's reading still holds them).
+pub fn hiragana(raw: &str) -> String {
+    render_offline(&as_japanese(raw))
+}
+
 fn restore_plain(
     ipc: &mut IPCService,
     raw: &str,
@@ -637,7 +734,7 @@ fn restore_plain(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mizuyokan_engine::{render_offline, segment};
+    use mizuyokan_engine::segment;
 
     fn candidates(texts: &[&str], subs: &[&str]) -> Candidates {
         Candidates {
@@ -682,6 +779,37 @@ mod tests {
         let shown = display(candidates(&["ｇｉｔ"], &["ｐｕｌｌしたら"]), &segments);
         assert_eq!(shown.texts[0], "git");
         assert_eq!(shown.sub_texts[0], "pullしたら");
+    }
+
+    #[test]
+    fn disowned_words_move_between_files() {
+        let dir = std::env::temp_dir().join(format!("mizuyokan-disown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(WORDS_FILENAME), "rebiew\nluck\n").unwrap();
+        std::fs::write(dir.join(UNWANTED_FILENAME), "put\n").unwrap();
+        record_disowned(
+            &dir,
+            &Disowned {
+                forgotten: vec!["rebiew".into()],
+                blocked: vec!["put".into()],
+                noted: vec!["get".into()],
+            },
+        );
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+        assert_eq!(read(WORDS_FILENAME), "luck\n");
+        assert_eq!(read(REJECTED_FILENAME), "rebiew\n");
+        assert_eq!(read(BLOCKED_FILENAME), "put\n");
+        assert_eq!(read(UNWANTED_FILENAME), "get\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hiragana_reads_the_whole_buffer_as_japanese() {
+        assert_eq!(hiragana("autoputto"), "あうとぷっと");
+        assert!(!has_english(None));
+        assert!(has_english(Some(segment("gitpullshitara").as_slice())));
+        assert!(!has_english(Some(segment("sukoshimatte").as_slice())));
     }
 
     #[test]
