@@ -98,7 +98,7 @@ impl JevClient {
         let options = [
             "A real word: a common English word, or a technical term, command, abbreviation                 or product name widely used in software and IT (for example: ssh, pc, npm,                 kubectl, github, docker, figma, slack)."
                 .to_string(),
-            "Not a real word: a typo, random key mashing, or a fragment of Japanese romaji                 typed without converting (for example: att, ltu, okik, dstry)."
+            "Not a real word: a misspelling of an English word (rebiew for review), random                 key mashing, or Japanese romaji typed without converting, possibly with a typo                 (for example: att, ltu, inala, okik, tokro, dstry)."
                 .to_string(),
         ];
         let probs = self.ask_choice(

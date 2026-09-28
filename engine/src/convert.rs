@@ -1263,6 +1263,9 @@ mod tests {
             ("ut", false),          // "uta"…
             ("altultu", false),     // あっっ
             ("ltu", false),         // っ
+            ("la", false),          // ぁ
+            ("inala", false),       // いなぁ
+            ("ulotti", false),      // うぉっち
             ("ssh", true),
             ("yoiunsmsrfr", false), // mashing
             ("dstry", false),       // typo

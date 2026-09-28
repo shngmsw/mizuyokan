@@ -168,7 +168,7 @@ impl Prefetcher {
         self.rejected.read().map(|r| r.clone()).unwrap_or_default()
     }
 
-    /// Add words judged not real (e.g. recorded by another process).
+    /// Add words not to learn (e.g. learned words the user turned down).
     pub fn note_rejected(&self, words: impl IntoIterator<Item = String>) {
         let Ok(mut rejected) = self.rejected.write() else {
             return;
@@ -385,22 +385,6 @@ impl Prefetcher {
             vetting.extend(due.iter().cloned());
         }
         due
-    }
-
-    /// Merge commit counts recorded elsewhere (another process); keeps the larger count.
-    pub fn note_sightings(&self, counts: impl IntoIterator<Item = (String, usize)>) {
-        let learned = self.learned();
-        let rejected = self.rejected();
-        let Ok(mut sightings) = self.sightings.lock() else {
-            return;
-        };
-        for (word, count) in counts {
-            if learned.contains(&word) || rejected.contains(&word) || sightings.len() >= MAX_LEARNED {
-                continue;
-            }
-            let seen = sightings.entry(word).or_insert(0);
-            *seen = (*seen).max(count);
-        }
     }
 
     /// [`may_be_english`] with the learned and blocked words.
@@ -732,9 +716,6 @@ mod tests {
         assert_eq!(p.sight(w("figma")), w("figma"));
         assert_eq!(p.remember(w("figma")), w("figma"));
         assert!(p.sight(w("figma")).is_empty(), "already learned");
-        // A count from another process's file counts too.
-        p.note_sightings([("docker".to_string(), 1)]);
-        assert_eq!(p.sight(w("docker")), w("docker"));
     }
 
     /// A stub Jev word check that answers `p` and records what it was asked.
@@ -784,9 +765,9 @@ mod tests {
         }
         assert!(p.undecided(["okik".to_string()]).is_empty());
         assert_eq!(asked.lock().unwrap().len(), 1, "asked only once");
-        // A rejection recorded by another process counts too.
+        // A rejection recorded in the file counts too.
         p.note_rejected(["dstry".to_string()]);
-        p.note_sightings([("dstry".to_string(), 5)]);
+        assert!(p.sight(["dstry".to_string()]).is_empty());
         assert!(p.sight(["dstry".to_string()]).is_empty());
     }
 
