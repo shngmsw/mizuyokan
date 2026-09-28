@@ -28,19 +28,15 @@ const SETTINGS_FILENAME: &str = "mizuyokan.json";
 /// English words learned from commits, one per line. Shared by every app
 /// that loads the IME; each process appends what it learns.
 const WORDS_FILENAME: &str = "mizuyokan_words.txt";
-/// Words committed but not learned yet, one line per commit. A word moves to
-/// WORDS_FILENAME once it has LEARN_AFTER_COMMITS lines here.
-const CANDIDATES_FILENAME: &str = "mizuyokan_word_candidates.txt";
-/// Words Jev judged not to be real English, one per line: never learned and
-/// never asked about again. Checks that failed are not written here.
+/// Learned words the user turned down, one per line: never learned again.
+/// Words not known to be English (commit counts, words Jev turned down) are
+/// kept in memory only, so romaji and typos are never written to disk.
 const REJECTED_FILENAME: &str = "mizuyokan_words_rejected.txt";
 /// Words turned down by going back to the all-Japanese reading often
 /// enough, one per line: never English when typed in lowercase.
 const BLOCKED_FILENAME: &str = "mizuyokan_words_blocked.txt";
 /// Such escapes of words not blocked yet, one line per escape.
 const UNWANTED_FILENAME: &str = "mizuyokan_words_unwanted.txt";
-/// Past this many lines the candidates file is started over.
-const MAX_CANDIDATE_LINES: usize = 2000;
 /// Defaults match karukan's idea of adaptive degrade: a few bad calls and we
 /// stop waiting on the enhancement layer so typing stays on plain azooKey.
 const JEV_FAIL_THRESHOLD_DEFAULT: u32 = 3;
@@ -338,10 +334,6 @@ fn words_path() -> Option<PathBuf> {
     Settings::path().map(|p| p.with_file_name(WORDS_FILENAME))
 }
 
-fn candidates_path() -> Option<PathBuf> {
-    Settings::path().map(|p| p.with_file_name(CANDIDATES_FILENAME))
-}
-
 fn rejected_path() -> Option<PathBuf> {
     Settings::path().map(|p| p.with_file_name(REJECTED_FILENAME))
 }
@@ -378,8 +370,6 @@ fn file_words(text: &str) -> impl Iterator<Item = String> + '_ {
 /// as they are, without today's `words_to_learn` rules.
 fn load_learned() {
     static WORDS_SEEN: LazyLock<Mutex<Option<SystemTime>>> = LazyLock::new(|| Mutex::new(None));
-    static CANDIDATES_SEEN: LazyLock<Mutex<Option<SystemTime>>> =
-        LazyLock::new(|| Mutex::new(None));
     static REJECTED_SEEN: LazyLock<Mutex<Option<SystemTime>>> = LazyLock::new(|| Mutex::new(None));
     static BLOCKED_SEEN: LazyLock<Mutex<Option<SystemTime>>> = LazyLock::new(|| Mutex::new(None));
     static UNWANTED_SEEN: LazyLock<Mutex<Option<SystemTime>>> = LazyLock::new(|| Mutex::new(None));
@@ -391,9 +381,6 @@ fn load_learned() {
     }
     if let Some(text) = read_if_changed(rejected_path(), &REJECTED_SEEN) {
         Prefetcher::global().note_rejected(file_words(&text));
-    }
-    if let Some(text) = read_if_changed(candidates_path(), &CANDIDATES_SEEN) {
-        Prefetcher::global().note_sightings(line_counts(&text));
     }
     if let Some(text) = read_if_changed(unwanted_path(), &UNWANTED_SEEN) {
         Prefetcher::global().note_unwanted(line_counts(&text));
@@ -435,22 +422,7 @@ pub fn learn(committed: &str, segments: Option<&[Segment]>) {
     if candidates.is_empty() {
         return;
     }
-    let due = prefetcher.sight(candidates.clone());
-    let pending: Vec<String> = candidates.into_iter().filter(|w| !due.contains(w)).collect();
-    if !pending.is_empty() {
-        debug_log!("seen once {pending:?}");
-        let path = candidates_path();
-        let too_long = path
-            .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .is_some_and(|t| t.lines().count() >= MAX_CANDIDATE_LINES);
-        if too_long {
-            if let Some(p) = &path {
-                let _ = std::fs::write(p, "");
-            }
-        }
-        append_lines(path, &pending);
-    }
+    let due = prefetcher.sight(candidates);
     if due.is_empty() {
         return;
     }
@@ -477,7 +449,6 @@ fn record_vetted(vetted: Vetted) {
     }
     if !vetted.rejected.is_empty() {
         debug_log!("not learned (Jev: not a real word) {:?}", vetted.rejected);
-        append_lines(rejected_path(), &vetted.rejected);
     }
     if !vetted.retry.is_empty() {
         debug_log!("word check failed: not learning {:?} yet", vetted.retry);
